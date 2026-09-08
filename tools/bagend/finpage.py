@@ -147,25 +147,29 @@ def build_payload(con: sqlite3.Connection) -> dict:
         "meta": {
             "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "schema": con.execute("SELECT value FROM _schema_meta WHERE key='schema_version'").fetchone()[0],
-            "page_protocol": 1,
+            "page_protocol": 2,
         },
-        "networth": {
-            "total": bal[0], "as_of": bal[1],
-            "as_ofs": [r[0] for r in series],
-            "totals": [round(r[1], 2) for r in series],
+        "pages": {
+            "retirement": {
+                "networth": {
+                    "total": bal[0], "as_of": bal[1],
+                    "as_ofs": [r[0] for r in series],
+                    "totals": [round(r[1], 2) for r in series],
+                },
+                "annuity": {
+                    "born_year": BORN_YEAR, "zero_age": AGE_100,
+                    "age_now": 2026 - BORN_YEAR, "start_year": 2026,
+                    "balance": bal[0], "balance_as_of": bal[1],
+                    "ss_by_age": ss_by_age,
+                    "ss67_monthly": ss67, "ss62_monthly": ss62,
+                    "go_broke_year": gb, "go_broke_rate": rate,
+                    "yield_long_term": yield_lt,
+                    "spending": {"current_2025": spend2025, "multiplier": mult, "planned": plan},
+                    "reference": reference,
+                },
+                "tax": tax,
+                "holdings_top": top,
+                "assumptions": assumptions,
+            },
         },
-        "annuity": {
-            "born_year": BORN_YEAR, "zero_age": AGE_100,
-            "age_now": 2026 - BORN_YEAR, "start_year": 2026,
-            "balance": bal[0], "balance_as_of": bal[1],
-            "ss_by_age": ss_by_age,
-            "ss67_monthly": ss67, "ss62_monthly": ss62,
-            "go_broke_year": gb, "go_broke_rate": rate,
-            "yield_long_term": yield_lt,
-            "spending": {"current_2025": spend2025, "multiplier": mult, "planned": plan},
-            "reference": reference,
-        },
-        "tax": tax,
-        "assumptions": assumptions,
-        "holdings_top": top,
     }

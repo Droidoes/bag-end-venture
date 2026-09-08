@@ -196,8 +196,8 @@ def cmd_export(args: argparse.Namespace) -> None:
         out.mkdir(parents=True, exist_ok=True)
         target = out / "finpage.json"
         target.write_text(json.dumps(payload, indent=1, default=str))
-        n_tax = len(payload["tax"])
-        n_series = len(payload["networth"]["as_ofs"])
+        n_tax = len(payload["pages"]["retirement"]["tax"])
+        n_series = len(payload["pages"]["retirement"]["networth"]["as_ofs"])
         print(f"finpage payload -> {target} ({n_series} net-worth points, {n_tax} tax years)")
 
 

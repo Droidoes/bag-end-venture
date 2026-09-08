@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bag End — Personal Capital Dashboard</title>
+<style>
+{{CORE_CSS}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Bag End <span class="accent">·</span> Personal Capital</h1>
+  <p class="subtitle">From books.db — ceiling first, plan second.</p>
+  <nav id="nav"></nav>
+</header>
+
+<div class="bar">
+  <span class="status" id="status">Connect Homepage-DB/BagEnd/finpage.json</span>
+  <button type="button" id="btnConnect">Connect finpage.json</button>
+  <input id="fileInput" type="file" accept="application/json,.json">
+</div>
+
+<main id="main" hidden></main>
+
+<script>
+{{CORE_JS}}
+
+{{PAGES_JS}}
+
+boot();
+</script>
+</body>
+</html>

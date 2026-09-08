@@ -118,6 +118,10 @@ framework ruling: one capability = one page, shared shell + one data contract
 - Never introduce a blocklisted vendor name into committed docs — the hygiene
   gate flags it (this session's vendor-name mentions were scrubbed from all
   committed files).
+- When a bug's root cause is an already-planned deployment (e.g., finpage
+  persistence failing on file:// while GitHub Pages hosting was pending),
+  lead with the root cause and the planned fix — offer workarounds only
+  after, never instead.
 
 ## 7. Where things live
 
