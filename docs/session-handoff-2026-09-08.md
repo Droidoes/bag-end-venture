@@ -122,6 +122,9 @@ framework ruling: one capability = one page, shared shell + one data contract
   persistence failing on file:// while GitHub Pages hosting was pending),
   lead with the root cause and the planned fix — offer workarounds only
   after, never instead.
+- GitHub Pages runs Jekyll over the repo by default and can fail mid-build on
+  a static tree — a root `.nojekyll` file serves files verbatim (finpage fix,
+  2026-09-08).
 
 ## 7. Where things live
 
