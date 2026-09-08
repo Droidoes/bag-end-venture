@@ -1,0 +1,20 @@
+# Bag End — the repo holds method, never numbers (AGENTS.md §4).
+# Session scratch and owner-refreshed snapshots (may contain figures):
+private/
+.scratch/
+*.snapshot
+*.snapshot.*
+
+# Numeric-file guards — data exports are never committed anywhere in the tree:
+*.csv
+*.xlsx
+*.xls
+*.qif
+*.ofx
+*.qfx
+
+# OS / editor / tooling cruft:
+.DS_Store
+Thumbs.db
+__pycache__/
+*.py[cod]

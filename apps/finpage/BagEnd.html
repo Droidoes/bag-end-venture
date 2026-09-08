@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bag End — Retirement Dashboard</title>
+<style>
+  :root {
+    --bg: #101418; --panel: #171d24; --line: #26303c; --text: #dbe4ee;
+    --muted: #8595a8; --gold: #d4a94e; --green: #7fbf7f; --red: #d97b7b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 18px 24px 6px; }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  h1 .accent { color: var(--gold); }
+  .subtitle { color: var(--muted); margin: 0 0 10px; font-size: 13px; }
+  .bar { display: flex; align-items: center; gap: 10px; padding: 8px 24px;
+         background: var(--panel); border-top: 1px solid var(--line);
+         border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .status { color: var(--muted); font-size: 13px; flex: 1; min-width: 220px; }
+  .status.ok { color: var(--green); }
+  button { background: #243040; color: var(--text); border: 1px solid var(--line);
+           border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #2c3a4e; }
+  input[type=file] { display: none; }
+  main { padding: 18px 24px 40px; max-width: 1080px; }
+  section { margin-bottom: 22px; }
+  h2 { font-size: 15px; color: var(--gold); margin: 0 0 10px;
+       border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+           gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line);
+          border-radius: 8px; padding: 12px 14px; }
+  .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase;
+                 letter-spacing: .04em; }
+  .card .value { font-size: 22px; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .card .hint { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-end;
+              margin-bottom: 12px; }
+  .ctl { display: flex; flex-direction: column; gap: 4px; font-size: 12px;
+         color: var(--muted); }
+  .ctl output { color: var(--text); font-weight: 600; font-size: 13px; }
+  .ctl input[type=range] { width: 150px; }
+  .ctl select { background: #243040; color: var(--text); border: 1px solid var(--line);
+                border-radius: 6px; padding: 4px 8px; }
+  .annuity-readout { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+                     gap: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px;
+          font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  tr.dim { color: var(--muted); }
+  .chart { width: 100%; height: 220px; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .defs { color: var(--muted); font-size: 12px; }
+  .defs li { margin: 3px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Bag End <span class="accent">·</span> Retirement Dashboard</h1>
+  <p class="subtitle">Personal capital, from books.db — ceiling first, plan second.</p>
+</header>
+
+<div class="bar">
+  <span class="status" id="status">Connect Homepage-DB/BagEnd/finpage.json</span>
+  <button type="button" id="btnConnect">Connect finpage.json</button>
+  <input id="fileInput" type="file" accept="application/json,.json">
+</div>
+
+<main id="main" hidden>
+
+  <section>
+    <h2>Vitals</h2>
+    <div class="cards">
+      <div class="card"><div class="label">Net worth</div><div class="value" id="c-nw">—</div><div class="hint" id="h-nw"></div></div>
+      <div class="card"><div class="label">Annuity ceiling (A_max)</div><div class="value" id="c-amax">—</div><div class="hint" id="h-amax">flat, zero at age 100</div></div>
+      <div class="card"><div class="label">Planned spending</div><div class="value" id="c-plan">—</div><div class="hint" id="h-plan"></div></div>
+      <div class="card"><div class="label">Headroom</div><div class="value" id="c-head">—</div><div class="hint" id="h-head">ceiling ÷ plan</div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Effective annuity — play with the plan</h2>
+    <div class="controls">
+      <div class="ctl">Yield
+        <input type="range" id="s-yield" min="0" max="5" step="0.25" value="3">
+        <output id="o-yield">3.0%</output>
+      </div>
+      <div class="ctl">SS claim age
+        <select id="s-claim"></select>
+      </div>
+      <div class="ctl">SS after go-broke year
+        <input type="range" id="s-rate" min="60" max="100" step="1" value="78">
+        <output id="o-rate">78%</output>
+      </div>
+      <div class="ctl">Spending ×
+        <input type="range" id="s-mult" min="100" max="300" step="5" value="200">
+        <output id="o-mult">2.00×</output>
+      </div>
+    </div>
+    <div class="annuity-readout">
+      <div class="card"><div class="label">A_max / year</div><div class="value" id="w-amax-y">—</div></div>
+      <div class="card"><div class="label">A_max / month</div><div class="value" id="w-amax-m">—</div></div>
+      <div class="card"><div class="label">Min balance on the path</div><div class="value" id="w-min">—</div></div>
+      <div class="card"><div class="label">At plan spend, age-100 balance</div><div class="value" id="w-end">—</div></div>
+    </div>
+    <p class="note">Ladder is flat nominal (the owner's model): balance − spend + SS, × (1+yield), SS from the first full year after the claim age, haircut from the Trustees go-broke year. Store reference below.</p>
+  </section>
+
+  <section>
+    <h2>Store reference (precomputed from books.db)</h2>
+    <table id="t-ref">
+      <thead><tr><th>Variant</th><th>Yield</th><th>A_max/yr</th><th>Plan end @100</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Net worth</h2>
+    <svg class="chart" id="chart" viewBox="0 0 1000 220" preserveAspectRatio="none"></svg>
+    <p class="note" id="chart-note"></p>
+  </section>
+
+  <section>
+    <h2>Top positions (by account consolidation)</h2>
+    <table id="t-hold">
+      <thead><tr><th>Ticker</th><th>Market value</th><th>Weight</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Filed tax history</h2>
+    <table id="t-tax">
+      <thead><tr><th>Year</th><th>Status</th><th>AGI</th><th>Taxable</th><th>Fed tax</th><th>NJ tax</th><th>Bracket</th><th>Std ded</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <p class="note">Std ded 0 = itemized (no standard deduction taken); — = not printed. Brackets from the preparer's Tax History Report; 2023–2025 status derived (flagged in store).</p>
+  </section>
+
+  <section>
+    <h2>Definitions</h2>
+    <ul class="defs">
+      <li><b>A_max (ceiling):</b> the flat annual withdrawal that lands the ladder at ~$0 at age 100 — "Effective Annuity (max)", an upper bound, not planned spending.</li>
+      <li><b>Planned spending:</b> current-year actual × the plan multiplier (owner ruling).</li>
+      <li><b>SS:</b> store estimates; base case pays the go-broke rate of scheduled benefits from the Trustees go-broke year onward.</li>
+      <li><b>Yield:</b> long-term nominal yield assumption, registered in the store.</li>
+    </ul>
+  </section>
+
+</main>
+
+<script>
+"use strict";
+/* Bag End retirement dashboard — data comes ONLY from a connected finpage.json
+   (built by `bagend.py export finpage`). No financial values live in this file. */
+
+let payload = null;
+let fileHandle = null;
+
+const $ = (id) => document.getElementById(id);
+const fmtUsd = (v, digits = 0) =>
+  v === null || v === undefined || !isFinite(v)
+    ? "—"
+    : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD",
+        maximumFractionDigits: digits }).format(v);
+const fmtNum = (v, digits = 2) =>
+  new Intl.NumberFormat("en-US", { maximumFractionDigits: digits }).format(v);
+
+function setStatus(msg, ok) {
+  const el = $("status");
+  el.textContent = msg;
+  el.classList.toggle("ok", !!ok);
+}
+
+/* ---------------- model (mirrors tools/bagend/finpage.py + q8) ---------- */
+
+function ladder(balance, spend0, yield_, escalate, ssSchedule, startYear, born, zeroAge) {
+  let bal = balance, s = spend0, minBal = Infinity, brokeAt = null;
+  for (let y = startYear; y <= born + zeroAge; y++) {
+    bal = (bal - s + (ssSchedule[y] || 0)) * (1 + yield_);
+    if (bal < 0) { brokeAt = y; break; }
+    minBal = Math.min(minBal, bal);
+    s *= (1 + escalate);
+  }
+  return { minBalance: brokeAt === null ? minBal : null,
+           brokeAt, endBalance: brokeAt === null ? bal : null };
+}
+
+function ssSchedule(monthly, rate, goBrokeYear, firstFullYear, born, zeroAge, stepChange) {
+  const out = {};
+  if (stepChange) {
+    for (let y = firstFullYear; y < goBrokeYear; y++) out[y] = monthly * 12;
+  }
+  const start = stepChange ? goBrokeYear : firstFullYear;
+  for (let y = start; y <= born + zeroAge; y++) out[y] = monthly * rate * 12;
+  return out;
+}
+
+function aMax(balance, yield_, ssSched, startYear, born, zeroAge) {
+  let lo = 0, hi = balance * 1.5;
+  for (let i = 0; i < 80; i++) {
+    const mid = (lo + hi) / 2;
+    const r = ladder(balance, mid, yield_, 0, ssSched, startYear, born, zeroAge);
+    if (r.brokeAt !== null || (r.endBalance || 0) < 0) hi = mid; else lo = mid;
+  }
+  return (lo + hi) / 2;
+}
+
+/* ---------------- rendering -------------------------------------------- */
+
+function applyPayload(data, label) {
+  if (!data || data.meta?.page_protocol !== 1) throw new Error("Not a Bag End finpage.json (protocol 1)");
+  payload = data;
+  const a = payload.annuity;
+  const claimSel = $("s-claim");
+  claimSel.innerHTML = "";
+  Object.keys(a.ss_by_age).map(Number).sort((x, y) => x - y).forEach(age => {
+    const opt = document.createElement("option");
+    opt.value = String(age);
+    opt.textContent = "Age " + age + " (" + fmtUsd(a.ss_by_age[age] * 12, 0) + "/yr)";
+    if (age === 67) opt.selected = true;
+    claimSel.appendChild(opt);
+  });
+  $("o-yield").value = String(a.yield_long_term);
+  $("s-yield").value = String(a.yield_long_term * 100);
+  $("o-rate").value = Math.round(a.go_broke_rate * 100) + "%";
+  $("s-rate").value = String(Math.round(a.go_broke_rate * 100));
+  const multPct = Math.round(a.spending.multiplier * 100);
+  $("o-mult").value = fmtNum(a.spending.multiplier) + "×";
+  $("s-mult").value = String(multPct);
+  setStatus("Connected: " + label + " — balance @ " + a.balance_as_of + " · " +
+            payload.networth.as_ofs.length + " net-worth points · " +
+            payload.tax.length + " tax years", true);
+  $("main").hidden = false;
+  renderAll();
+}
+
+function renderAll() {
+  renderVitals();
+  renderWidget();
+  renderRef();
+  renderChart();
+  renderHoldings();
+  renderTax();
+}
+
+function currentWidgetInputs() {
+  const a = payload.annuity;
+  const age = Number($("s-claim").value);
+  const rate = Number($("s-rate").value) / 100;
+  const mult = Number($("s-mult").value) / 100;
+  const yld = Number($("s-yield").value) / 100;
+  const monthly = a.ss_by_age[age] || 0;
+  const firstFullYear = a.born_year + age + 1;
+  const sched = ssSchedule(monthly, rate, a.go_broke_year, firstFullYear,
+                           a.born_year, a.zero_age, true);
+  const plan = a.spending.current_2025 * mult;
+  return { yld, sched, plan, firstFullYear, monthly };
+}
+
+function renderVitals() {
+  const a = payload.annuity;
+  $("c-nw").textContent = fmtUsd(payload.networth.total);
+  $("h-nw").textContent = "as of " + payload.networth.as_of;
+  const sched = ssSchedule(a.ss67_monthly, a.go_broke_rate, a.go_broke_year,
+                           a.born_year + 67 + 1, a.born_year, a.zero_age, false);
+  const am = aMax(a.balance, a.yield_long_term, sched, a.start_year, a.born_year, a.zero_age);
+  $("c-amax").textContent = fmtUsd(am);
+  $("h-amax").textContent = "claim 67 · " + fmtUsd(am / 12) + "/mo";
+  $("c-plan").textContent = fmtUsd(a.spending.planned);
+  $("h-plan").textContent = fmtUsd(a.spending.current_2025) + " × " + fmtNum(a.spending.multiplier);
+  $("c-head").textContent = fmtNum(am / a.spending.planned) + "×";
+  $("h-head").textContent = "at store yield " + fmtNum(a.yield_long_term * 100, 1) + "%";
+}
+
+function renderWidget() {
+  const a = payload.annuity;
+  const { yld, sched, plan } = currentWidgetInputs();
+  const am = aMax(a.balance, yld, sched, a.start_year, a.born_year, a.zero_age);
+  const run = ladder(a.balance, plan, yld, 0, sched, a.start_year, a.born_year, a.zero_age);
+  $("w-amax-y").textContent = fmtUsd(am);
+  $("w-amax-m").textContent = fmtUsd(am / 12);
+  $("w-min").textContent = run.minBalance === null ? "broke " + run.brokeAt : fmtUsd(run.minBalance);
+  $("w-end").textContent = run.endBalance === null ? "broke " + run.brokeAt : fmtUsd(run.endBalance);
+}
+
+function renderRef() {
+  const tb = $("t-ref").querySelector("tbody");
+  tb.innerHTML = "";
+  for (const r of payload.annuity.reference) {
+    const tr = document.createElement("tr");
+    const end = r.plan_end_at_100 === null ? "broke " + r.plan_broke_at : fmtUsd(r.plan_end_at_100);
+    tr.innerHTML = "<td>" + r.variant + "</td><td>" + r.yield_label + " (" +
+      fmtNum(r.yield * 100, 1) + "%)</td><td>" + fmtUsd(r.a_max) + "</td><td>" + end + "</td>";
+    tb.appendChild(tr);
+  }
+}
+
+function renderChart() {
+  const nw = payload.networth;
+  const svg = $("chart");
+  const W = 1000, H = 220, pad = 8;
+  const xs = nw.as_ofs, ys = nw.totals;
+  if (!xs.length) return;
+  let lo = Math.min(...ys), hi = Math.max(...ys);
+  if (lo === hi) { lo -= 1; hi += 1; }
+  const X = i => pad + (W - 2 * pad) * i / Math.max(1, xs.length - 1);
+  const Y = v => H - pad - (H - 2 * pad) * (v - lo) / (hi - lo);
+  let grid = "", pts = "";
+  for (let g = 0; g <= 4; g++) {
+    const gy = pad + (H - 2 * pad) * g / 4;
+    grid += '<line x1="' + pad + '" y1="' + gy + '" x2="' + (W - pad) +
+            '" y2="' + gy + '" stroke="rgba(127,140,160,0.12)" stroke-width="1"/>';
+  }
+  ys.forEach((v, i) => { pts += (i ? " " : "") + X(i).toFixed(1) + "," + Y(v).toFixed(1); });
+  svg.innerHTML = grid +
+    '<polyline points="' + pts + '" fill="none" stroke="#d4a94e" stroke-width="2"/>' +
+    '<text x="' + (W - pad) + '" y="' + (H - 4) + '" fill="#8595a8" font-size="11" text-anchor="end">' +
+    xs[xs.length - 1] + " · " + fmtUsd(ys[ys.length - 1]) + '</text>';
+  $("chart-note").textContent = "Range " + xs[0] + " → " + xs[xs.length - 1] +
+    " · min " + fmtUsd(lo) + " · max " + fmtUsd(hi);
+}
+
+function renderHoldings() {
+  const tb = $("t-hold").querySelector("tbody");
+  tb.innerHTML = "";
+  for (const h of payload.holdings_top || []) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td>" + h.symbol + "</td><td>" + fmtUsd(h.market_value) +
+      "</td><td>" + fmtNum(h.weight_pct, 1) + "%</td>";
+    tb.appendChild(tr);
+  }
+}
+
+function renderTax() {
+  const tb = $("t-tax").querySelector("tbody");
+  tb.innerHTML = "";
+  for (const t of payload.tax) {
+    const tr = document.createElement("tr");
+    if (t.needs_verify) tr.classList.add("dim");
+    const std = t.std_deduction === null ? "—" : fmtUsd(t.std_deduction);
+    tr.innerHTML = "<td>" + t.tax_year + (t.needs_verify ? " *" : "") + "</td><td>" +
+      t.filing_status + "</td><td>" + fmtUsd(t.agi) + "</td><td>" +
+      fmtUsd(t.taxable_income) + "</td><td>" + fmtUsd(t.total_tax) + "</td><td>" +
+      fmtUsd(t.state_income_tax) + "</td><td>" + (t.marginal_bracket || "—") +
+      "</td><td>" + std + "</td>";
+    tb.appendChild(tr);
+  }
+}
+
+/* ---------------- connect flow (Homepage-DB pattern) ------------------- */
+
+function saveHandle(h) {
+  try {
+    const req = indexedDB.open("bagend-finpage", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("kv");
+    req.onsuccess = () => {
+      const tx = req.result.transaction("kv", "readwrite");
+      tx.objectStore("kv").put(h, "handle");
+    };
+  } catch (_) { /* persistence is best-effort */ }
+}
+
+async function tryRestore() {
+  if (!window.showOpenFilePicker) return;
+  try {
+    const db = await new Promise((res, rej) => {
+      const req = indexedDB.open("bagend-finpage", 1);
+      req.onupgradeneeded = () => req.result.createObjectStore("kv");
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
+    });
+    const h = await new Promise((res) => {
+      const tx = db.transaction("kv", "readonly");
+      const g = tx.objectStore("kv").get("handle");
+      g.onsuccess = () => res(g.result);
+      g.onerror = () => res(undefined);
+    });
+    if (!h) return;
+    const perm = await h.queryPermission({ mode: "read" });
+    if (perm !== "granted") {
+      if ((await h.requestPermission({ mode: "read" })) !== "granted") return;
+    }
+    const file = await h.getFile();
+    applyPayload(JSON.parse(await file.text()), h.name);
+  } catch (_) { /* silent: user connects manually */ }
+}
+
+async function connectPicker() {
+  try {
+    if (window.showOpenFilePicker) {
+      const [handle] = await window.showOpenFilePicker({
+        types: [{ description: "JSON", accept: { "application/json": [".json"] } }],
+        startIn: "documents",
+      });
+      fileHandle = handle;
+      saveHandle(handle);
+      const file = await handle.getFile();
+      applyPayload(JSON.parse(await file.text()), handle.name);
+      return;
+    }
+  } catch (err) {
+    if (err && err.name === "AbortError") return;
+  }
+  $("fileInput").click();
+}
+
+$("btnConnect").addEventListener("click", connectPicker);
+$("fileInput").addEventListener("change", (ev) => {
+  const file = ev.target.files[0];
+  if (!file) return;
+  const rd = new FileReader();
+  rd.onload = () => {
+    try { applyPayload(JSON.parse(rd.result), file.name); }
+    catch (e) { setStatus("Load failed: " + e.message, false); }
+  };
+  rd.readAsText(file);
+});
+
+["s-yield", "s-rate", "s-mult"].forEach(id => {
+  $(id).addEventListener("input", () => {
+    const v = Number($(id).value);
+    $("o-" + id.slice(2)).value =
+      id === "s-yield" ? fmtNum(v, 2) + "%" :
+      id === "s-rate" ? v + "%" : fmtNum(v / 100) + "×";
+    if (payload) renderWidget();
+  });
+});
+$("s-claim").addEventListener("change", () => { if (payload) renderWidget(); });
+
+tryRestore();
+</script>
+</body>
+</html>
