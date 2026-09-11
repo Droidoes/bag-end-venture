@@ -69,6 +69,12 @@ returning to the stable :3080 instance · **Figures scrubbed** per house rule.
   0.1.5-rc.1 (tool-using child → null); teammates/subagents have no model
   override. Both fan-out templates carry the warning in their headers.
 
+**Boundary note (logged, not silent):** `AGENTS.md` §5.4 keeps the Obsidian vault
+read-only from this repo. The Agent Teams write-up was written to
+`~/Obsidian/AIML/dsh/` on the owner's direct instruction (2026-09-11) — a
+one-off, owner-directed exception, logged here per §5.6. No other vault path was
+touched, and nothing financial was written.
+
 ## What survives / what dies
 
 | Survives (disk) | Dies with the instance |
