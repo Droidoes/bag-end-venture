@@ -1,27 +1,27 @@
 {
   "_purpose": "Canonical model routing table for Bag End fan-out. The workflow templates (tools/workflows/*.js) consume this via args. NEVER hand-compose provider/model pairs in a delegation prompt — copy from here. Provider ids must match ~/.dsh/settings.yaml llm-pi-ai.providers (deepseek-official resolves via the harness registry; see flash_team note).",
-  "_updated": "2026-09-07",
+  "_updated": "2026-09-08",
   "_policy": {
     "explicit_provider_on_every_call": true,
     "preflight_required": true,
     "preflight_attempts": 3,
     "preflight_note": "A single null is not a dead route. Transient failures look identical to structured-output contract failures and to route death; retry N times before condemning a leg, and record every attempt.",
     "identity_check": "each child quotes the model name from its own system prompt 'powered by the <model> model' line; a mismatch is a routing bug, not noise",
-    "leg_priority": "owner ruling 2026-09-07: assign legs by priority — deepseek-v4-flash + glm-5.3-flash first (1), qwen3.8-flash second (2), gpt-5.6-luna third (3); fall through to a lower priority only when higher-priority routes are exhausted or unsuitable for the batch"
+    "leg_priority": "owner ruling 2026-09-08 (supersedes 2026-09-07): assign legs by priority — deepseek-flash (V41-Flash) + glm-5.3-flash first (1), qwen3.8-flash second (2), gpt-5.6-luna third (3); fall through to a lower priority only when higher-priority routes are exhausted or unsuitable for the batch"
   },
   "cos": {
-    "seat": "deepseek-v4-pro — OWNER RULING 2026-09-07: flash models do not suffice for the COS seat; deepseek-v4-pro IS the COS (pro fixed as chair)",
-    "as_of_this_entry": { "provider": "deepseek-official", "model": "deepseek-v4-pro", "effort": "max" },
-    "independence": "the COS model is in the build; exclude it from post-hoc pro review of artifacts built under its chair"
+    "seat": "deepseek-flash (display name DeepSeek-V41-Flash) — OWNER RULING 2026-09-08: V41-Flash supersedes the 2026-09-07 pro-chair ruling and holds the COS seat; deepseek-v4-pro/deepseek-v4-flash retired from this table (legacy ids remain in the harness catalog)",
+    "as_of_this_entry": { "provider": "deepseek-official", "model": "deepseek-flash", "effort": "high" },
+    "independence": "legs are ALWAYS separate instances with self-contained briefs — no shared context with the COS — so a deepseek-flash leg verifies the COS instance independently of its reasoning (owner clarification 2026-09-08). What same-model legs cannot cover is model-level (correlated) error: identical weights share identical blind spots. Safeguard: every batch keeps at least one cross-family leg (glm-5.3-flash, or qwen3.8-flash/gpt-5.6-luna), and the chair model stays excluded from post-hoc pro review"
   },
   "flash_team": [
-    { "label": "deepseek-v4-flash", "provider": "deepseek-official", "model": "deepseek-v4-flash",
-      "priority": 1, "status": "PONG 2026-09-07",
-      "note": "previously listed unavailable; empirically live (ping + identity verified). DeepSeek models are managed internally by the dsh app (~/.dsh/llm-deepseek registry) — do NOT add a deepseek provider block under llm-pi-ai.providers in ~/.dsh/settings.yaml; the app resolves deepseek-official itself and a duplicate entry would confuse the model pull-down UI (owner-verified 2026-09-07)." },
+    { "label": "deepseek-flash", "provider": "deepseek-official", "model": "deepseek-flash",
+      "priority": 1, "status": "PONG 2026-09-08 (V41-Flash, identity verified, schema-capable)",
+      "note": "DeepSeek-V41-Flash. Also holds the COS chair (owner ruling 2026-09-08). Legs on this route are fresh instances with self-contained briefs — independent of the COS instance/context; keep one cross-family leg (glm-5.3-flash) per batch for model-level correlated error. DeepSeek models are managed internally by the dsh app (~/.dsh/llm-deepseek registry) — do NOT add a deepseek provider block under llm-pi-ai.providers in ~/.dsh/settings.yaml; the app resolves deepseek-official itself (owner-verified 2026-09-07)." },
     { "label": "glm-5.3-flash", "provider": "zai-payg", "model": "glm-5.3-flash",
-      "priority": 1, "status": "PONG 2026-09-06", "note": "satisfies structured-output contract" },
+      "priority": 1, "status": "PONG 2026-09-08", "note": "satisfies structured-output contract; two independent structure-survey legs on 2026-09-08" },
     { "label": "qwen3.8-flash", "provider": "qwencloud-payg", "model": "qwen3.8-flash",
-      "priority": 2, "status": "PONG 2026-09-07 (3-attempt rule)",
+      "priority": 2, "status": "PONG 2026-09-08 (3-attempt rule)",
       "note": "former COS model; plain flash seat now — no clone role" },
     { "label": "gpt-5.6-luna", "provider": "openai", "model": "gpt-5.6-luna",
       "priority": 3, "status": "PONG 2026-09-08 (owner fix; canonical schema ping verified, identity matched)",
@@ -31,7 +31,7 @@
   "pro_reviewers": {
     "purpose": "post-hoc independent review of finished artifacts only; owner-initiated in separate sessions, never part of the build",
     "roster": ["qwen3.8-max", "glm-5.3", "grok-4.6", "gpt-5.6-sol"],
-    "excluded": "deepseek-v4-pro — it holds the COS chair (owner ruling 2026-09-07) and is therefore in the build",
+    "excluded": "deepseek-flash — it holds the COS chair (owner ruling 2026-09-08) and doubles as a priority-1 leg family, so it is in the build twice over",
     "note": "configured reviewer ids today: qwen3.8-max-0902 (qwencloud-payg), glm-5.3 (zai-payg), gpt-5.6-sol (openai); grok-4.6 has no configured provider here",
     "independence_rule": "a model that holds the COS chair may not also review artifacts built under that chair"
   }

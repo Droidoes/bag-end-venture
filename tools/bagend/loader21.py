@@ -1165,6 +1165,96 @@ def load_statement(conn, batch, spec, acct_ids, path: Path) -> int:
 USB_CREDIT_MARKERS = ("CREDIT", "PAYMENT", "REFUND", "REBATE", "REVERSAL")
 
 
+def _words_by_row(words: list) -> list[list]:
+    """Cluster word tuples (x0,y0,x1,y1,text) into visual rows by baseline."""
+    rows: dict[int, list] = {}
+    for w in words:
+        rows.setdefault(round(w[1] / 3) * 3, []).append(w)
+    return [sorted(v, key=lambda w: w[0]) for _, v in sorted(rows.items())]
+
+
+def _parse_chase(path: Path) -> tuple[str | None, list[dict]]:
+    """Chase Amazon card statement (suffix 5679). 3-column activity table:
+    Date (MM/DD, no year) | Description | signed $ Amount (unsigned=purchase,
+    leading '-'=payment/credit). Section bands ('PAYMENTS AND OTHER CREDITS',
+    'PURCHASE') are standalone rows. 'Order Number' sublines carry no
+    date/amount and are skipped. as_of = statement date from the filename."""
+    import fitz
+    m = _re.match(r"(\d{4})(\d{2})(\d{2})-statements", path.name)
+    if not m:
+        return None, []
+    yr, mo = int(m.group(1)), int(m.group(2))
+    as_of = f"{yr:04d}-{mo:02d}-{int(m.group(3)):02d}"
+    doc = fitz.open(str(path))
+    txns = []
+    for page in doc:
+        for row in _words_by_row(page.get_text("words")):
+            if len(row) < 2:
+                continue
+            texts = [w[4] for w in row]
+            joined = " ".join(texts)
+            if joined in ("PAYMENTS AND OTHER CREDITS", "PURCHASE",
+                          "ACCOUNT ACTIVITY", "ACCOUNT ACTIVITY (CONTINUED)",
+                          "SHOP WITH POINTS ACTIVITY", "Split Transaction"):
+                continue
+            date_w = next((w for w in row if w[0] < 80 and _re.fullmatch(r"\d{2}/\d{2}", w[4])), None)
+            amt_w = next((w for w in reversed(row)
+                          if _re.fullmatch(r"-?\$?[\d,]+\.\d{2}", w[4]) and w[2] > 430), None)
+            if date_w is None or amt_w is None:
+                continue  # header, Order-Number subline, page furniture
+            signed = amt_w[4].replace("$", "").replace(",", "")
+            neg = signed.startswith("-")
+            amt = float(signed.lstrip("-"))
+            desc_words = [w[4] for w in row
+                          if w is not date_w and w is not amt_w and w[0] > 80 and w[2] < 430]
+            desc = " ".join(desc_words).strip()[:100]
+            if not desc:
+                continue
+            mm, dd = (int(x) for x in date_w[4].split("/"))
+            txn_year = yr if mm <= mo else yr - 1  # period spans the prior month
+            notation = "PAYMENT" if "PAYMENT" in desc.upper() else ("CREDIT" if neg else "PURCHASE")
+            txns.append({"event_date": f"{txn_year:04d}-{mm:02d}-{dd:02d}",
+                         "description": desc, "notation": notation, "amount": amt})
+    doc.close()
+    return as_of, txns
+
+
+def _parse_citi(path: Path) -> tuple[str | None, list[dict]]:
+    """Citi Visa statement. Page 3 table: Sale Date | Post Date | Description |
+    Amount. Credits print the literal word 'minus' glued to the amount. Post
+    date optional (a lone date sits in the POST x-band — do not shift columns).
+    as_of = month-end of the statement month (filename carries month only)."""
+    import fitz
+    from datetime import date
+    m = _re.match(r"Citi-Visa-(\d{4})-(\d{2})\.pdf", path.name)
+    if not m:
+        return None, []
+    yr, mo = int(m.group(1)), int(m.group(2))
+    last_day = (date(yr + (mo // 12), mo % 12 + 1, 1) - date.resolution).day if mo < 12 else 31
+    as_of = f"{yr:04d}-{mo:02d}-{last_day:02d}"
+    doc = fitz.open(str(path))
+    txns = []
+    for page in doc:
+        for row in _words_by_row(page.get_text("words")):
+            date_ws = [w for w in row if _re.fullmatch(r"\d{2}/\d{2}", w[4]) and w[0] < 115]
+            amt_w = next((w for w in reversed(row)
+                          if _re.fullmatch(r"(minus)?\$?[\d,]+\.\d{2}", w[4]) and w[0] > 300), None)
+            desc_ws = [w for w in row if w[0] >= 115 and w is not amt_w]
+            if not date_ws or amt_w is None or not desc_ws:
+                continue  # chips ('New Charges', 'Standard Purchases'), headers
+            tok = amt_w[4]
+            neg = tok.startswith("minus")
+            amt = float(tok.replace("minus", "").replace("$", "").replace(",", ""))
+            desc = " ".join(w[4] for w in desc_ws).strip()[:100]
+            mm, dd = (int(x) for x in date_ws[-1][4].split("/"))  # sale date; falls back to post band
+            txn_year = yr if mm <= mo else yr - 1
+            notation = "PAYMENT" if "PAYMENT" in desc.upper() else ("CREDIT" if neg else "PURCHASE")
+            txns.append({"event_date": f"{txn_year:04d}-{mm:02d}-{dd:02d}",
+                         "description": desc, "notation": notation, "amount": amt})
+    doc.close()
+    return as_of, txns
+
+
 def _parse_usbank(path: Path) -> tuple[str | None, list[dict]]:
     import fitz
     doc = fitz.open(str(path))
@@ -1217,7 +1307,13 @@ def load_card_statement(conn, batch, spec, acct_ids, path: Path) -> int:
     ensure_sentinels(conn, source_id)
     unmapped_id = get_sentinel(conn, source_id, "dim_txn_type")
     cat_id = get_sentinel(conn, source_id, "dim_category")
-    as_of, txns = _parse_usbank(path)
+    parser = spec.get("parser", "usbank")
+    if parser == "chase":
+        as_of, txns = _parse_chase(path)
+    elif parser == "citi":
+        as_of, txns = _parse_citi(path)
+    else:
+        as_of, txns = _parse_usbank(path)
     if as_of is None:
         raise LoadError(f"{path.name}: no statement period found — refusing to guess")
     acct = acct_ids[spec["account"]]

@@ -68,7 +68,17 @@ Drive (live tree) ──catalog──> private/catalog.tsv        (the map of wh
 3. **Sources are never mutated** — defects are flagged with evidence, never
    silently fixed.
 4. **Ledger vs state:** ledgers carry many rows per date; state series are 1:1
-   (one legitimate same-day pair). Two keying families; absence is not zero.
+   (one legitimate same-day pair). Two keying families. **Blanks are not
+   uniform** (owner ruling 2026-09-10, stated to apply to all sheet
+   extraction): a blank numeric cell *inside an existing period row* is **0** —
+   the source's own convention for "nothing happened that period" (e.g. 401k
+   catch-up before 2019). An **absent row or period is not recorded** — never
+   0: absence of evidence is not evidence of absence, and a series that ends at
+   2026 says nothing about 2027. Ingest keeps the two apart
+   (`presence='zero_from_blank'` vs no row at all). Rows that exist only as
+   pre-series labels — e.g. Tax Rates 2010–2014 before the 2015 series start —
+   are not period records at all: the layout declares where the series begins.
+   (Owner rulings 2026-09-10/11.)
 5. **The allow-list is the ingest gate** — header rows are confirmed by a human
    (Joe), never guessed; unresolved headers are refused loudly.
 6. **Derived/scratch/worksheet/duplicate tabs are never ingested** — double
@@ -138,3 +148,23 @@ analysis.
   (Homepage-DB connect pattern, zero committed numbers, JS/Python model
   parity); owner framework ruling: one capability = one page on a shared
   shell + one data contract (ledger #15, #16 queued).
+- **2026-09-10 (Roth, layout day)** — native **structure** read shipped
+  (`bagend.py sheets grid`: merges + formulas + formats, literals redacted by
+  default): the values-only path could not show group bands or derived columns,
+  which is what left the unresolved-header backlog in Task #3. First tabs
+  resolved with it — `stats / Inv Income` (worked entry, subtotal bands outside
+  every merge), `stats / 401k Contributions` (no merges at all; the recorded
+  "merged 2-row header" note was stale), `stats / Taxes` (four group bands; two
+  columns are cross-sheet `IMPORTRANGE` pulls from the SSA tab) — and `Buybacks`
+  ruled a **worksheet**, never ingested. The blank rule above was ratified in
+  the same pass, and two source flags were filed (D15 subtotal drops an
+  account; D16 duplicate total/catch-up columns).
+- **2026-09-11 (Roth, structure day)** — **Task #3 closed**: all 11 unresolved
+  allow-list entries settled with the owner; `layouts.json` now carries 0
+  unresolved entries, and the layout schema gained the tiers and block data the
+  cases forced (`group_row`, `sub_header_row`, `first_data_row`, `skip_rows`,
+  `derived_columns`, `external_links`, `header_totals`). The blank rule was
+  completed (blank cell in a live row = 0; absent row = not recorded; pre-series
+  label rows = not records), and the xlsx→Sheets migration defect family was
+  swept and **certified clean across all 13 sheets** (`bagend.py sheets errors
+  --all` reports 0 error cells in every tab). Loader follow-through: Task #18.

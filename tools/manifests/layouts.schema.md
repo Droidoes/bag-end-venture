@@ -19,7 +19,15 @@ brokerage account number was found inside a `tools/` file — see §Hygiene belo
       "tabs": {
         "<tab title or pattern like '<year>'>": {
           "role": "raw | derived | scratch | reference | documentation | duplicate",
-          "header_row": 1 | "unresolved",
+          "header_row": 1 | 2,
+          "group_row": 1,                        // optional: group/banner tier ABOVE header_row
+          "sub_header_row": 3,                   // optional: second label tier BELOW header_row
+          "key_column": "A",                     // optional: row-key column when it carries no label
+          "first_data_row": 6,                   // optional: when data starts below the header block
+          "header_totals": {"C2": "=SUM(C5:C187)"}, // optional: totals sitting INSIDE header cells
+          "skip_rows": [3, 4, 5],                // optional: non-record rows (grand totals, spacers)
+          "derived_columns": ["E", "J"],         // optional: formula columns — never summed with inputs
+          "external_links": { "K": "Buybacks" }, // optional: cells whose values come from another tab
           "grain": "one row per …",
           "dedupe": "disjoint | natural_key_prefer_latest",
           "warning": "…", "must": "…", "note": "…", "needs": "…"
@@ -30,6 +38,17 @@ brokerage account number was found inside a `tools/` file — see §Hygiene belo
   "_cross_cutting": { "…": "…" }
 }
 ```
+
+### Fields added 2026-09-10 (native structure read)
+
+`group_row`, `key_column`, `first_data_row`, `skip_rows`, `derived_columns` and
+`external_links` exist because `sheets dump` (values only) cannot show a merged
+group band or a derived column. The first two-tier tab resolved after the
+structure read (`stats / Inv Income`) had **unlabelled subtotals sitting outside
+every merge** and a grand-total row directly under the header — neither is
+expressible with `header_row` alone. The fields are optional and only meaningful
+where the tab really has that shape; unresolved entries keep
+`header_row: "unresolved"` until a human confirms.
 
 ## Roles — what the ingest tool does with each
 

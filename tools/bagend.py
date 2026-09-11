@@ -9,6 +9,10 @@ Commands:
   catalog merge-registry                       Add my-data-records.json entries into the census
   catalog find <needle>                        Search the census for a file/folder
   fetch <alias|drive-id> [--name NAME]         Download/export a Drive file into private/raw/
+  sheets tabs <source>                         Tab inventory (grid tabs only)
+  sheets dump <source> [--tab T] [--alias A]   Typed CSV of one/all grid tabs
+  sheets grid <source> --tab T [--max-rows N]  STRUCTURAL read: merges + formulas
+                                               (structure only unless --with-values)
   inspect <local-path> [--md]                  Structure survey of an xlsx/csv (tabs, headers, dates)
   ingest xlsx <path> <sheet> <table> [--skiprows N]
                                                Ingest one xlsx tab into private/books.db
@@ -83,6 +87,39 @@ def _record_provenance(dest: Path, file_id: str, meta: dict, method: str) -> Non
 def cmd_sheets(args: argparse.Namespace) -> None:
     """Direct Sheets reads — preferred over xlsx export for native Sheets."""
     from bagend import sheets as sheets_mod
+    if args.sheets_cmd == "errors":
+        # Migration-defect hunt: which tabs still hold error cells, and which
+        # formula produced them. Structure-only (literals redacted).
+        targets = sorted(config.DRIVE_SHEETS) if args.all_sheets else list(args.sources)
+        if not targets:
+            sys.exit("sheets errors: name at least one alias, or pass --all")
+        lines = ["# Migration-error scan (structure-only, literals redacted)", ""]
+        flagged_total = 0
+        for alias in targets:
+            res = sheets_mod.scan_errors(gws_client.resolve(alias),
+                                         max_rows=args.max_rows, max_cols=args.max_cols)
+            print(f"{alias}: {res['spreadsheet']} — {res['tabs_scanned']} tabs, "
+                  f"{len(res['tabs_with_errors'])} with error cells", flush=True)
+            for f in res.get("tabs_failed", []):
+                print(f"    !! {f['tab']}: {f['error']}", flush=True)
+                lines.append(f"- !! {alias} / {f['tab']} — not scanned: {f['error']}")
+            for t in res["tabs_with_errors"]:
+                cols = ", ".join(f"{k} x{v}" for k, v in t["columns"].items())
+                print(f"    {t['tab']} (gid {t['sheet_id']}): {t['error_cells']} error cells | "
+                      f"{cols} | rows {t['row_range'][0]}-{t['row_range'][1]}", flush=True)
+                lines.append(f"- **{alias} / {t['tab']}** (gid {t['sheet_id']}) — "
+                             f"{t['error_cells']} error cells | {cols} | "
+                             f"rows {t['row_range'][0]}-{t['row_range'][1]}")
+                for f in t["formulas"]:
+                    print(f"        {f[:95]}", flush=True)
+                    lines.append(f"  - `{f[:140]}`")
+                flagged_total += 1
+        if args.out:
+            out = Path(args.out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text("\n".join(lines) + "\n")
+            print(f"\nrepair list -> {_rel(out)} ({flagged_total} tabs flagged)")
+        return
     file_id = gws_client.resolve(args.source)
     if args.sheets_cmd == "tabs":
         meta = sheets_mod.metadata(file_id)
@@ -107,6 +144,22 @@ def cmd_sheets(args: argparse.Namespace) -> None:
             _record_provenance(out, file_id, {"name": meta["title"],
                                               "mimeType": "application/vnd.google-apps.spreadsheet",
                                               "modifiedTime": ""}, "sheets.values.get")
+    elif args.sheets_cmd == "grid":
+        # Native STRUCTURAL read: merges + formulas. Values-only dumps cannot
+        # show that a derived column is a formula or where a group band merges.
+        payload = sheets_mod.grid_structure(
+            file_id, args.tab, max_rows=args.max_rows, max_cols=args.max_cols,
+            with_values=args.with_values)
+        text = json.dumps(payload, indent=1, default=str)
+        if args.out:
+            out = Path(args.out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(text)
+            print(f"grid structure -> {_rel(out)} ({len(payload['merges'])} merges, "
+                  f"{len(payload['formula_cells'])} formula cells, "
+                  f"{payload['nonempty_cells']} non-empty cells)")
+        else:
+            print(text)
 
 
 def cmd_fetch(args: argparse.Namespace) -> None:
@@ -229,6 +282,23 @@ def main() -> None:
     sh_dump.add_argument("--tab", help="single tab title (default: all grid tabs)")
     sh_dump.add_argument("--alias", help="short alias used to name the CSVs")
     sh_dump.add_argument("--out", help="destination dir (default private/raw/sheets/)")
+
+    sh_grid = sh_sub.add_parser("grid", help="native structural read: merges + formulas")
+    sh_grid.add_argument("source")
+    sh_grid.add_argument("--tab", required=True, help="exact grid tab title")
+    sh_grid.add_argument("--max-rows", type=int, default=60, dest="max_rows")
+    sh_grid.add_argument("--max-cols", type=int, default=30, dest="max_cols")
+    sh_grid.add_argument("--with-values", action="store_true", dest="with_values",
+                         help="include effective values (default: structure only)")
+    sh_grid.add_argument("--out", help="write JSON here instead of stdout")
+
+    sh_err = sh_sub.add_parser("errors", help="scan for error cells (xlsx->Sheets migration defects)")
+    sh_err.add_argument("sources", nargs="*", help="alias(es); omit with --all")
+    sh_err.add_argument("--all", action="store_true", dest="all_sheets",
+                        help="scan every alias in config.DRIVE_SHEETS")
+    sh_err.add_argument("--max-rows", type=int, default=120, dest="max_rows")
+    sh_err.add_argument("--max-cols", type=int, default=30, dest="max_cols")
+    sh_err.add_argument("--out", help="write the repair list here")
 
     p_ins = sub.add_parser("inspect")
     p_ins.add_argument("path")

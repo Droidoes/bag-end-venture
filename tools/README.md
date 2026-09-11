@@ -55,8 +55,11 @@ python3 tools/bagend.py catalog merge-registry
 python3 tools/bagend.py catalog find "Social-Security"
 
 # 4. Read a source (alias from config.py or raw Drive ID)
-#    native Google Sheet  -> typed CSV dump (the ONLY sanctioned read path)
+#    native Google Sheet  -> typed CSV dump (the sanctioned path for VALUES)
 python3 tools/bagend.py sheets dump trading-2019 --tab Performance
+#    ...and for LAYOUT work, read the same tab's STRUCTURE natively:
+#    merges + formulas + formats, no export (structure only unless --with-values)
+python3 tools/bagend.py sheets grid stats --tab "Inv Income" --max-rows 45
 #    uploaded file (xlsx/pdf/csv) -> the original bytes, unchanged
 python3 tools/bagend.py fetch <drive-file-id>
 #    (`fetch` REFUSES native Sheets: use `sheets dump`; escape hatch exists
@@ -130,7 +133,17 @@ after fetch) need no elevation.
 | Source kind | Command | Result |
 |---|---|---|
 | **native Google Sheet** | `sheets dump <alias> [--tab NAME]` | per-tab **CSV**, typed values, used-range only |
+| **native Google Sheet — layout** | `sheets grid <alias> --tab NAME` | **merges + formulas + formats** (JSON); no values unless `--with-values` |
 | **uploaded file** (xlsx/csv/pdf) | `fetch <alias>` | the original bytes, unchanged |
+
+**Values are not structure.** `sheets dump` calls `values.get`, which returns
+values only: a merged group band arrives as a label in its anchor cell, and a
+derived column arrives as an ordinary number. Two independent survey legs on
+2026-09-10 had to *infer* subtotal semantics and could not see that the columns
+were formulas — the direct cause of the unresolved-header backlog (Task #3).
+Use `sheets grid` whenever the question is "what IS this tab" rather than
+"what does it say"; it reads the same sheet natively through
+`spreadsheets.get(includeGridData)`, so the no-export rule is untouched.
 
 Native Sheets are **read directly through the Sheets API**, not exported to xlsx.
 The export path cost this project real diagnosis time — it injected ~1,000 blank

@@ -12,7 +12,7 @@ build.** Pro review is initiated manually by the owner in separate sessions,
 which is what makes it independent.
 
 ```
-COS (deepseek-v4-pro, owner ruling 2026-09-07) → fan out N flash legs on the same batch
+COS (deepseek-flash, owner ruling 2026-09-08) → fan out N flash legs on the same batch
                            → legs write full reports to private/, return compact summaries
                            → COS reconciles by convergence (n/n, (n-1)/n, 1/n)
                            → schema/charter draft
@@ -23,27 +23,39 @@ COS (deepseek-v4-pro, owner ruling 2026-09-07) → fan out N flash legs on the s
 
 | Seat | Model | Provider | Notes |
 |---|---|---|---|
-| **COS** | `deepseek-v4-pro` — **owner ruling 2026-09-07: flash models do not suffice for the COS seat; deepseek-v4-pro IS the COS** | `deepseek-official` | Pro tier fixed as the COS chair; holding the chair counts as *in the build* (independence note below). Owner-facing behavior per the `cos-role` skill. Decomposition, briefs, reconciliation, spot-verification, filing. |
-| Extraction leg | `deepseek-v4-flash` | `deepseek-official` | PONG ✓ 2026-09-07. **Priority 1** (owner ruling 2026-09-07). |
-| Extraction leg | `glm-5.3-flash` | `zai-payg` | PONG ✓ 2026-09-06. **Priority 1** (owner ruling 2026-09-07). |
-| Extraction leg | `qwen3.8-flash` | `qwencloud-payg` | PONG ✓ 2026-09-07 (3-attempt rule). **Priority 2** (owner ruling 2026-09-07). Plain flash seat — no longer a COS clone. |
-| Extraction leg | `gpt-5.6-luna` | `openai` | PONG ✓ 2026-09-06 on retest (first attempt returned null — transient, see §3 rule 5). **Priority 3** (owner ruling 2026-09-07). Schema-capable. |
-| Reviewer (external) | Qwen3.8-Max · GLM-5.3 · Grok-4.6 · GPT-5.6-Sol — **not DeepSeek-V4-Pro (it holds the COS chair)** | owner-run | Reviews finished artifacts in separate sessions; feedback absorbed per §5. |
+| **COS** | `deepseek-flash` (display name **DeepSeek-V41-Flash**) — **owner ruling 2026-09-08: V41-Flash holds the COS seat, superseding the 2026-09-07 pro-chair ruling** | `deepseek-official` | Holding the chair counts as *in the build* (independence note below). Owner-facing behavior per the `cos-role` skill. Decomposition, briefs, reconciliation, spot-verification, filing. |
+| Extraction leg | `deepseek-flash` | `deepseek-official` | PONG ✓ 2026-09-08 (V41-Flash, identity + schema verified). **Priority 1**. Separate instance from the COS with a self-contained brief — independent of the COS instance. |
+| Extraction leg | `glm-5.3-flash` | `zai-payg` | PONG ✓ 2026-09-08. **Priority 1** (owner ruling 2026-09-08). Cross-family leg — the independence workhorse. |
+| Extraction leg | `qwen3.8-flash` | `qwencloud-payg` | PONG ✓ 2026-09-08 (3-attempt rule). **Priority 2**. Plain flash seat — no clone role. |
+| Extraction leg | `gpt-5.6-luna` | `openai` | PONG ✓ 2026-09-08 (owner fix; canonical schema ping verified — see run log for the outage history). **Priority 3**. Schema-capable. |
+| Reviewer (external) | Qwen3.8-Max · GLM-5.3 · Grok-4.6 · GPT-5.6-Sol — **not DeepSeek-V41-Flash (`deepseek-flash`), which holds the COS chair and doubles as a priority-1 leg** | owner-run | Reviews finished artifacts in separate sessions; feedback absorbed per §5. |
 
-The COS is `deepseek-v4-pro` (pro tier, and therefore **in the build**). Worker
-seats are **flash only**, in owner-assigned priority order (ruling 2026-09-07):
-**`deepseek-v4-flash` + `glm-5.3-flash` (priority 1) · `qwen3.8-flash`
+The COS is `deepseek-flash` — **DeepSeek-V41-Flash** (owner ruling 2026-09-08;
+the older `deepseek-v4-pro`/`deepseek-v4-flash` ids are retired from this
+table). Worker seats stay flash-only, in owner-assigned priority order:
+**`deepseek-flash` + `glm-5.3-flash` (priority 1) · `qwen3.8-flash`
 (priority 2) · `gpt-5.6-luna` (priority 3)**. Assign routes by priority; fall
 through to a lower priority only when the higher-priority routes are exhausted
 or unsuitable for the batch. Seats are **cheap and unlimited by design** — run
-multiple independent legs per model on the same batch (e.g. 2×deepseek-flash +
-2×glm = four hits) rather than treating one model per batch as the unit of work.
+multiple independent legs per model on the same batch rather than treating one
+model per batch as the unit of work.
 
-**Independence note (owner ruling 2026-09-07):** the COS chair is held by
-`deepseek-v4-pro`, a pro-tier reviewer name, so it is *in the build* and must be
-**excluded from the post-hoc pro-review roster** for artifacts produced under
-its chair. Substitution is the owner's call; default remaining reviewers:
-`qwen3.8-max`, `glm-5.3`, and any other owner-run seat.
+**Independence note (owner rulings 2026-09-07/08):** independence has two
+layers, and the panel covers both.
+
+1. **Instance/context independence.** Every leg is a *fresh instance* driven by
+   a *self-contained brief* — it never sees the COS conversation, so it cannot
+   echo the COS's framing or conclusion. A `deepseek-flash` leg therefore
+   verifies the COS instance genuinely, even though the chair runs the same
+   model (owner clarification 2026-09-08).
+2. **Model independence.** Same weights share the same blind spots, so
+   agreement between same-model legs can be correlated error rather than
+   confirmation. Safeguard: **every batch keeps at least one cross-family leg**
+   (`glm-5.3-flash`, or `qwen3.8-flash`/`gpt-5.6-luna`).
+
+The COS chair (`deepseek-flash`) is *in the build* and stays **excluded from the
+post-hoc pro-review roster**. Default remaining reviewers: `qwen3.8-max`,
+`glm-5.3`, and any other owner-run seat.
 
 ## 3. Routing rules (inherited from the 10x playbook, non-negotiable)
 

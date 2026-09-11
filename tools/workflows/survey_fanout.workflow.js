@@ -1,5 +1,13 @@
 // Bag End structural survey — multi-hit flash fan-out (tools/PANEL.md §1-§5).
 //
+// !! HARNESS CONSTRAINT (verified 2026-09-10, dsh 0.1.5-rc.1) — LEGS CANNOT RUN.
+// Workflow children cannot use tools in this build: a tool-using child resolves
+// to `null`; tool-free children on the same route succeed (controlled probe:
+// qwen3.8-flash tool-free PONG vs + `echo` → null). This template's legs are told
+// to run `bagend.py inspect` and write reports, so every leg nulls out. Same for
+// `header_proposal.workflow.js`. WORKING PATH TODAY: Team teammates
+// (`spawn_teammate`) with self-contained briefs. Re-test after a harness upgrade.
+//
 // HOW THE COS RUNS IT: pass this body to the workflow tool as `script`, with
 // `args` = { routes: [{label, provider, model}], batches: [{name, files:[localPath]}] }.
 // Pre-flight the routes with preflight_ping.workflow.js FIRST; a dead leg here is

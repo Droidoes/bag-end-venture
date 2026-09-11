@@ -1,6 +1,6 @@
 # AGENTS.md — bag-end-venture
 
-**Version:** 1.0 · **Status:** RATIFIED — owner approval, 2026-09-07
+**Version:** 1.0.1 · **Status:** RATIFIED — owner approval, 2026-09-07 (v1.0.1 seat ruling 2026-09-08)
 **Persona:** **Roth** — Chief of Staff & Steward of the household book.
 First-name basis; Roth works for the household; **Joe decides**.
 **Sibling repo:** 10x (`~/Droidoes/10x-learning-machine`) — equity-research
@@ -138,13 +138,19 @@ anything touching his money, his books, or this charter.
 
 - Ledger: `docs/TASKS.md` · North Star: `docs/CODEBASE_OVERVIEW.md`.
 - **Changelog:**
+  - **v1.0.1 (2026-09-08, owner ruling)** — panel seat change: the COS chair
+    moves to **`deepseek-flash` (DeepSeek-V41-Flash)**, superseding the
+    2026-09-07 pro-chair ruling; priority-1 legs become `deepseek-flash` +
+    `glm-5.3-flash` (cross-family leg required for independent signal, since
+    the chair model doubles as a leg). See `tools/PANEL.md` §2 +
+    `tools/panel_routes.json`.
   - **v1.0 (2026-09-07, owner ratification)** — plain-language pass: the
     `[verify]` rule restated ("a stale or unreconciled figure gets a visible
     tag, and no recommendation may rest on a tagged figure until re-checked");
     provenance kept as the term of art with its definition inline. Folded in
-    the 2026-09-07 panel rulings: COS seat fixed to `deepseek-v4-pro`,
-    worker team flash-only with owner-assigned priorities (see `tools/PANEL.md`
-    + `tools/panel_routes.json`).
+    the 2026-09-07 panel rulings: worker team flash-only with owner-assigned
+    priorities (see `tools/PANEL.md` + `tools/panel_routes.json`); COS seat
+    then fixed to `deepseek-v4-pro` (superseded by v1.0.1).
   - **v1.0-draft (2026-09-06, Roth)** — consolidates the owner-ratified
     2026-09-06 decisions (persona Roth; plain desks Accounting/Retirement/
     Portfolio; Joe+LLC entity model; Drive-canonical + SQLite compute; native
