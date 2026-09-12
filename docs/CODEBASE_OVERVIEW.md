@@ -168,3 +168,21 @@ analysis.
   label rows = not records), and the xlsx→Sheets migration defect family was
   swept and **certified clean across all 13 sheets** (`bagend.py sheets errors
   --all` reports 0 error cells in every tab). Loader follow-through: Task #18.
+- **2026-09-12 (Roth, capability day)** — **model-pinned, tool-using fan-out
+  verified**, and the panel protocol corrected with it: `subagent` accepts
+  `provider`/`model`/`reasoning_effort` (all four flash routes pinned; each child
+  quoted its own identity line verbatim and executed real tool calls), the
+  binding is **per session at session start** (enabling the setting needs a new
+  conversation — a restart is not enough; the failure text is
+  `child model selection is disabled for this tool instance`), and workflow
+  `agent()` children **can** use tools — retiring the 2026-09-10 constraint that
+  had parked both fan-out templates. `subagent_fork` deliberately exposes no
+  model fields (keeps the inherited prefix eligible for KV-cache reuse); workflow
+  `agent()` accepts `provider`/`model` but rejects `reasoning_effort`. Toolchain:
+  **Task #19(a) closed** — the `query` path opens `books.db` read-only
+  (`_connect_ro()`), so a stray `DROP` can no longer destroy the store. Ledger
+  #21 records the capability. Remaining gate between the ratified layout
+  knowledge and the loader: **Task #18** — the six Task #3 tier fields
+  (`group_row`, `sub_header_row`, `first_data_row`, `skip_rows`,
+  `derived_columns`, `external_links`) exist only in the allow-list, which
+  `loader21` never reads.
