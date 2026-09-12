@@ -147,6 +147,33 @@ Two operational notes that will outlive the day:
 Full record: `tools/PANEL.md` §3 ("Delegation doors") and
 `~/Obsidian/AIML/dsh/dsh-subagent-architecture-2026-09-12.md`.
 
+## 10. A constraint we chose *not* to fix — `gws` under the sandbox
+
+`gws` **writes on every token acquisition** — it sets permissions on its token
+directory and rewrites `token_cache.json`. Under the dsh `workspace-write`
+sandbox the only writable roots are the session workspace and `/tmp`, and `/tmp`
+is a per-command private tmpfs (a file written in one bash call is gone in the
+next). So `~/.config/gws` can never be writable, and the writable set is
+**hardcoded** — no settings key, no env var, no path allowlist. The symptom is
+misleading: `gws auth status` works (keyring read, persists nothing) while
+`gws tasks …` fails with `os error 30` / `authError` even when auth is perfectly
+healthy.
+
+Three options were weighed on 2026-09-12 and the owner chose the do-nothing path:
+
+| Option | Verdict |
+|---|---|
+| **A — batch every `gws` read into one escalated call per session** | **CHOSEN.** One approval per session; no posture change. |
+| B — point `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` at the workspace | Rejected: would move Drive/Gmail/Calendar credentials into the repo tree. |
+| C — launch dsh with `DSH_PERMISSION_MODE=danger-full-access` | Rejected: also sets the approval policy to `never`, disabling ask-before-writes house-wide. |
+
+**The lesson is the decision, not the workaround.** A tooling constraint that
+cannot be removed cleanly should be *decided once, recorded with its rejected
+alternatives, and never re-litigated* — otherwise every session re-pays the same
+investigation. The working rule now lives in the `session-catchup` skill: batch
+the reads, take one approval, and report the failure cause instead of letting it
+look like an empty result list.
+
 ---
 
 ## See also
