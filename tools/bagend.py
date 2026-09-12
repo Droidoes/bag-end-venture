@@ -13,6 +13,8 @@ Commands:
   sheets dump <source> [--tab T] [--alias A]   Typed CSV of one/all grid tabs
   sheets grid <source> --tab T [--max-rows N]  STRUCTURAL read: merges + formulas
                                                (structure only unless --with-values)
+  sheets snapshot <source> --tab T             v0.3 §3 structural artifact (P1):
+                                               [--with-notes] [--out PATH]   typed cells + formulas + merges
   inspect <local-path> [--md]                  Structure survey of an xlsx/csv (tabs, headers, dates)
   ingest xlsx <path> <sheet> <table> [--skiprows N]
                                                Ingest one xlsx tab into private/books.db
@@ -160,6 +162,31 @@ def cmd_sheets(args: argparse.Namespace) -> None:
                   f"{payload['nonempty_cells']} non-empty cells)")
         else:
             print(text)
+    elif args.sheets_cmd == "snapshot":
+        # P1 artifact writer (v0.3 §3): typed cells + real formulas + merges +
+        # explicit in-rectangle blanks — the loader's future ingest input.
+        # Read-only on the API; the live fetch belongs to the COS, the
+        # artifact to private/raw/sheets/.
+        payload = sheets_mod.snapshot(file_id, args.tab, with_notes=args.with_notes)
+        tab_slug = re.sub(r"[^A-Za-z0-9]+", "_", args.tab).strip("_")
+        out = (Path(args.out) if args.out
+               else config.RAW_DIR / "sheets" / f"{payload['alias']}__{tab_slug}.json")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=1, default=str) + "\n")
+        kinds = [c["kind"] for c in payload["cells"]]
+        mix = ", ".join(f"{k} x{kinds.count(k)}" for k in sorted(set(kinds)))
+        indet = sum(1 for c in payload["cells"]
+                    if c["kind"] == "spill" and c.get("spill_of") is None)
+        print(f"snapshot {payload['alias']}/{args.tab} -> {_rel(out)} "
+              f"({len(kinds)} cells [{mix}], {len(payload['merges'])} merges, "
+              f"sha {payload['artifact_sha256'][:12]}…, "
+              f"truncated={payload['truncated']})")
+        if payload["truncated"]:
+            print("  !! truncated=true — the loader refuses a truncated artifact; "
+                  "widen the window or expect a re-fetch", flush=True)
+        if indet:
+            print(f"  !! {indet} spill cell(s) with spill_of=null — the loader will "
+                  "quarantine them", flush=True)
 
 
 def cmd_fetch(args: argparse.Namespace) -> None:
@@ -320,6 +347,17 @@ def main() -> None:
     sh_err.add_argument("--max-rows", type=int, default=120, dest="max_rows")
     sh_err.add_argument("--max-cols", type=int, default=30, dest="max_cols")
     sh_err.add_argument("--out", help="write the repair list here")
+
+    sh_snap = sh_sub.add_parser(
+        "snapshot",
+        help="v0.3 §3 structural artifact: typed cells + formulas + merges (P1)")
+    sh_snap.add_argument("source")
+    sh_snap.add_argument("--tab", required=True, help="exact grid tab title")
+    sh_snap.add_argument("--with-notes", action="store_true", dest="with_notes",
+                         help="include note metadata (has_note/note_is_formula/masked "
+                              "formula only — never raw note text)")
+    sh_snap.add_argument("--out", help="write JSON here "
+                                       "(default private/raw/sheets/<alias>__<tab>.json)")
 
     p_ins = sub.add_parser("inspect")
     p_ins.add_argument("path")
