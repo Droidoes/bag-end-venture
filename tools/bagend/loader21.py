@@ -39,8 +39,10 @@ def assert_schema(conn: sqlite3.Connection) -> None:
     if not fk:
         raise LoadError("PRAGMA foreign_keys is OFF on this connection — refusing to load")
     row = conn.execute("SELECT value FROM _schema_meta WHERE key='schema_version'").fetchone()
-    if row != (SCHEMA_VERSION,):
-        raise LoadError(f"store schema is {row}, expected {SCHEMA_VERSION} — apply tools/schema/books.sql to a fresh store")
+    # row-factory agnostic: tuple rows and sqlite3.Row both compare by value here
+    found = None if row is None else row[0]
+    if found != SCHEMA_VERSION:
+        raise LoadError(f"store schema is {found!r}, expected {SCHEMA_VERSION} — apply tools/schema/books.sql to a fresh store")
 
 
 def norm_label(s) -> str:

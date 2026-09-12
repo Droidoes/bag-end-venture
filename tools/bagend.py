@@ -220,12 +220,35 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def _connect_ro():
+    """Open the store strictly read-only.
+
+    The query path must never be able to mutate books.db: with `mode=ro` any DDL
+    or DML fails at prepare time, so a stray `DROP` cannot destroy data (plain
+    connect() persisted DDL while rolling DML back only on close — the 2026-09-11
+    finding behind Task #19a).
+    """
+    import sqlite3
+    conn = sqlite3.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
+    # Connection-scoped and write-free, so it is legal on a read-only handle;
+    # loader.assert_schema requires it to be ON.
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
 def cmd_query(args: argparse.Namespace) -> None:
     import sqlite3
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = _connect_ro()
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(args.sql).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "readonly" in str(exc):
+            sys.exit(f"query is READ-ONLY — {exc}.\n"
+                     f"Writes belong to the loader/ingest path "
+                     f"(tools/bagend/loader21.py), never to `query`.")
+        raise
+    try:
         if not rows:
             print("(no rows)")
             return
@@ -238,10 +261,8 @@ def cmd_query(args: argparse.Namespace) -> None:
 
 def cmd_export(args: argparse.Namespace) -> None:
     if args.export_cmd == "finpage":
-        import sqlite3
         from bagend import finpage
-        con = sqlite3.connect(config.DB_PATH)
-        con.execute("PRAGMA foreign_keys=ON")
+        con = _connect_ro()
         loader21.assert_schema(con)
         payload = finpage.build_payload(con)
         con.close()
