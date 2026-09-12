@@ -228,3 +228,32 @@ fault-injection tests at each cutover boundary · **the two-zeros harness case**
 Task #19(c) needs `numfmt_pattern`, delivered in P1 but the fix itself is separate ·
 Task #7 · charter amendment v1.0.2 (the `AGENTS.md` native-read rule and both Bag
 End skills still describe the values-only path) · Drive comment threads.
+
+## 13. Amendments
+
+Recorded here rather than as a new version, because the panel's finding was that
+this design must remain **one** document.
+
+- **2026-09-12 — fifth cell kind, `blank`.** The P1 writer emits explicit blanks
+  as `kind:"blank"` instead of leaving the reader to infer them from the
+  rectangle (§3's example listed four kinds). §4's table is unchanged in
+  substance: `kind:"blank"` maps to `origin=entered, presence=zero_from_blank`.
+  Accepted because it makes a blank a **stated fact**, never an absence — which
+  is precisely what the ratified blank rule requires.
+- **2026-09-12 — `kind:"error"` for errored cells**, not `kind:"formula"`, with
+  `error_type` retained alongside. §4 already requires `presence='error'`; the
+  kind is named after the outcome rather than the entry form.
+- **2026-09-12 — live mask defect, fixed.** The first live call failed with
+  `Request contains an invalid argument`: the request field mask carried one extra
+  closing paren after a second self-closing field was added to
+  `grid_structure`'s tail. Bisected against the live API and corrected; the
+  independent typed-value parity probe then passed with 0 mismatches and 0
+  serial→date hazards.
+  **Lesson, as a standing gate:** the P1 harness is socket-guarded by design, so
+  it **cannot** catch API-shape errors. **Any reader change requires a live smoke
+  call before it is called done** — an offline green battery is not verification
+  of an API contract.
+- **2026-09-12 — `_typed` residual limit, flagged not fixed.** `_typed` converts
+  only *integer* serials, so a DATE_TIME cell with a fractional part stays a raw
+  serial; the loader must not read it as a date. Fixing it is task #19(c)'s
+  territory.
