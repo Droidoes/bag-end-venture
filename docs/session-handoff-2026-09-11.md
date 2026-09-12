@@ -65,9 +65,17 @@ returning to the stable :3080 instance · **Figures scrubbed** per house rule.
   `restore.sh` at `~/.dsh/backups/pre-teamlab-<timestamp>/`.
 - Agent-team bundles are mounted **only** in the `teamlab` profile; on :3080 the
   teammate/task-board tools do not exist.
-- Harness limit to remember: workflow `agent()` children cannot use tools on dsh
+- **Harness limits — SUPERSEDED 2026-09-12; read this line, not the struck one
+  below.** Workflow `agent()` children **can** use tools on the current build, and
+  `subagent` accepts `provider`/`model`/`reasoning_effort` for all four flash
+  routes (verified end to end). Both fan-out templates had their `DO NOT RUN YET`
+  headers retired. See `tools/PANEL.md` §3 ("Delegation doors"), ledger #21, and
+  `~/Obsidian/AIML/dsh/dsh-subagent-architecture-2026-09-12.md`.
+- ~~Harness limit to remember: workflow `agent()` children cannot use tools on dsh
   0.1.5-rc.1 (tool-using child → null); teammates/subagents have no model
-  override. Both fan-out templates carry the warning in their headers.
+  override. Both fan-out templates carry the warning in their headers.~~
+  Retired 2026-09-12. The **teammate** half still holds; the workflow half and the
+  subagent half no longer do.
 
 **Boundary note (logged, not silent):** `AGENTS.md` §5.4 keeps the Obsidian vault
 read-only from this repo. The Agent Teams write-up was written to

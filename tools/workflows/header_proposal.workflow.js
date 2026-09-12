@@ -1,16 +1,15 @@
 // Bag End header-row proposal survey — multi-hit flash fan-out (tools/PANEL.md §1-§5).
 //
-// !! HARNESS CONSTRAINT (verified 2026-09-10, dsh 0.1.5-rc.1) — DO NOT RUN YET.
-// Workflow children (`agent(...)` in a workflow script) cannot use tools in this
-// build: a child that calls bash/read resolves to `null`, while tool-free
-// children on the same route succeed (controlled within-run probe: qwen3.8-flash
-// tool-free PONG vs qwen3.8-flash + `echo` → null). Every leg of this template
-// needs `inspect` + a report file, so all legs return null and the run reports
-// `legs_failed` for every batch. Same limitation applies to
-// `survey_fanout.workflow.js`. WORKING PATH TODAY: run the legs as Team
-// teammates (`spawn_teammate`) with self-contained briefs — that is how Task #3
-// was executed on 2026-09-10 (see private/layouts/task3-proposal-2026-09-10.md).
-// Re-test this template after any harness upgrade.
+// CONSTRAINT RETIRED 2026-09-12 — RUN THIS. The 2026-09-10 finding (dsh
+// 0.1.5-rc.1: `agent(...)` children could not use tools; a tool-using child
+// resolved to `null`) no longer holds on the current build. Re-verified with an
+// unfakeable proof: two workflow children on two different routes each wrote a
+// unique nonce to disk via bash, confirmed from the COS shell; both also accepted
+// explicit provider/model. Full evidence: tools/PANEL.md §3, "Delegation doors".
+// Caveat: workflow children are one-shot — they CANNOT be steered mid-run with
+// `send_message`; steer by re-dispatching.
+// The Team-teammate workaround that executed Task #3 on 2026-09-10 is no longer
+// required (history: private/layouts/task3-proposal-2026-09-10.md).
 //
 // WHY THIS EXISTS: the allow-list is the ingest gate and `header_row` is
 // authoritative, not heuristic (tools/manifests/layouts.schema.md rules 1-2).

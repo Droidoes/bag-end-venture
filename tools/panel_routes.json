@@ -1,13 +1,25 @@
 {
   "_purpose": "Canonical model routing table for Bag End fan-out. The workflow templates (tools/workflows/*.js) consume this via args. NEVER hand-compose provider/model pairs in a delegation prompt — copy from here. Provider ids must match ~/.dsh/settings.yaml llm-pi-ai.providers (deepseek-official resolves via the harness registry; see flash_team note).",
-  "_updated": "2026-09-08",
+  "_updated": "2026-09-12",
   "_policy": {
     "explicit_provider_on_every_call": true,
     "preflight_required": true,
     "preflight_attempts": 3,
     "preflight_note": "A single null is not a dead route. Transient failures look identical to structured-output contract failures and to route death; retry N times before condemning a leg, and record every attempt.",
     "identity_check": "each child quotes the model name from its own system prompt 'powered by the <model> model' line; a mismatch is a routing bug, not noise",
-    "leg_priority": "owner ruling 2026-09-08 (supersedes 2026-09-07): assign legs by priority — deepseek-flash (V41-Flash) + glm-5.3-flash first (1), qwen3.8-flash second (2), gpt-5.6-luna third (3); fall through to a lower priority only when higher-priority routes are exhausted or unsuitable for the batch"
+    "leg_priority": "owner ruling 2026-09-08 (supersedes 2026-09-07): assign legs by priority — deepseek-flash (V41-Flash) + glm-5.3-flash first (1), qwen3.8-flash second (2), gpt-5.6-luna third (3); fall through to a lower priority only when higher-priority routes are exhausted or unsuitable for the batch",
+    "subagent_model_pinning": {
+      "available": true,
+      "added": "2026-09-12",
+      "enabled_via": "~/.dsh/settings.yaml -> subagent-model-selection (enabled: true + allowedModels)",
+      "bound_to": "the `subagent` tool's schema, built once at SESSION START. Enabling the setting mid-session, or restarting dsh and resuming an old conversation, leaves the old schema in place. The fix is a NEW CONVERSATION — a restart is not enough. Verified empirically 2026-09-12: the identical call failed with the error below in the resumed session `COS - dsv41-flash` and succeeded in the next new session.",
+      "disabled_error": "Error: child model selection is disabled for this tool instance",
+      "verified_2026_09_12": "all four flash routes pinned on `subagent`; every child quoted its own identity line verbatim and executed bash + read + glob (deepseek-flash, glm-5.3-flash, qwen3.8-flash, gpt-5.6-luna). `workflow` agent() separately pinned glm-5.3-flash + qwen3.8-flash and used tools — proved by two children writing unique nonce files to disk, confirmed from the COS shell.",
+      "not_available_on": "`subagent_fork` — its schema omits provider/model by design, keeping the child's route equal to the parent so the inherited prefix stays eligible for KV-cache reuse. `workflow` agent() accepts provider/model but REJECTS reasoning_effort: effort pinning is subagent-only.",
+      "untested": "reasoning_effort pinning — children do not report their effort, so the identity check cannot confirm it. Test per route before relying on it; gpt-5.6-luna is effort-value sensitive ('minimal' 400s).",
+      "steerability": "`subagent` and `subagent_fork` children are continuable and answer send_message; `workflow` agent() children are one-shot and CANNOT be steered mid-run — re-dispatch instead.",
+      "retires": "the 2026-09-10 note that workflow agent() children cannot use tools (a tool-using child resolved to `null` on dsh 0.1.5-rc.1). Retired 2026-09-12; both parked templates are runnable again."
+    }
   },
   "cos": {
     "seat": "deepseek-flash (display name DeepSeek-V41-Flash) — OWNER RULING 2026-09-08: V41-Flash supersedes the 2026-09-07 pro-chair ruling and holds the COS seat; deepseek-v4-pro/deepseek-v4-flash retired from this table (legacy ids remain in the harness catalog)",
@@ -16,16 +28,16 @@
   },
   "flash_team": [
     { "label": "deepseek-flash", "provider": "deepseek-official", "model": "deepseek-flash",
-      "priority": 1, "status": "PONG 2026-09-08 (V41-Flash, identity verified, schema-capable)",
+      "priority": 1, "status": "PONG 2026-09-08 (V41-Flash, identity verified, schema-capable) · 2026-09-12 model-pinned + tool-using verified",
       "note": "DeepSeek-V41-Flash. Also holds the COS chair (owner ruling 2026-09-08). Legs on this route are fresh instances with self-contained briefs — independent of the COS instance/context; keep one cross-family leg (glm-5.3-flash) per batch for model-level correlated error. DeepSeek models are managed internally by the dsh app (~/.dsh/llm-deepseek registry) — do NOT add a deepseek provider block under llm-pi-ai.providers in ~/.dsh/settings.yaml; the app resolves deepseek-official itself (owner-verified 2026-09-07)." },
     { "label": "glm-5.3-flash", "provider": "zai-payg", "model": "glm-5.3-flash",
-      "priority": 1, "status": "PONG 2026-09-08", "note": "satisfies structured-output contract; two independent structure-survey legs on 2026-09-08" },
+      "priority": 1, "status": "PONG 2026-09-08 · 2026-09-12 model-pinned + tool-using verified (also verified as a workflow agent() child)", "note": "satisfies structured-output contract; two independent structure-survey legs on 2026-09-08" },
     { "label": "qwen3.8-flash", "provider": "qwencloud-payg", "model": "qwen3.8-flash",
-      "priority": 2, "status": "PONG 2026-09-08 (3-attempt rule)",
+      "priority": 2, "status": "PONG 2026-09-08 (3-attempt rule) · 2026-09-12 model-pinned + tool-using verified (also verified as a workflow agent() child)",
       "note": "former COS model; plain flash seat now — no clone role" },
     { "label": "gpt-5.6-luna", "provider": "openai", "model": "gpt-5.6-luna",
-      "priority": 3, "status": "PONG 2026-09-08 (owner fix; canonical schema ping verified, identity matched)",
-      "note": "2026-09-08 history: schema-constrained pings null x3 while plain-text route was alive (structured result missing); root cause reasoningEfforts off-value sent verbatim on effort-less requests ('minimal' 400s; 'none' correct) plus a route-level compat breakage — fixed by owner, verified by the canonical gate. Schema-capable." }
+      "priority": 3, "status": "PONG 2026-09-08 (owner fix; canonical schema ping verified, identity matched) · 2026-09-12 model-pinned + tool-using verified",
+      "note": "2026-09-08 history: schema-constrained pings null x3 while plain-text route was alive (structured result missing); root cause reasoningEfforts off-value sent verbatim on effort-less requests ('minimal' 400s; 'none' correct) plus a route-level compat breakage — fixed by owner, verified by the canonical gate. Schema-capable. Identity line reads 'powered by the gpt-5.6-luna model'." }
   ],
   "unavailable": [],
   "pro_reviewers": {

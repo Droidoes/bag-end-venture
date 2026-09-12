@@ -84,6 +84,45 @@ delegation prompt. Reusable scripts:
 `tools/workflows/preflight_ping.workflow.js` (the gate) and
 `tools/workflows/survey_fanout.workflow.js` (structure survey).
 
+### Delegation doors (verified 2026-09-12)
+
+Three doors create children. All of them hand a request to the same
+`ctx.subagents` registry; each door is welded to one provider backend at
+composition time.
+
+| Door | Backend | Model pinning | Child |
+|---|---|---|---|
+| `subagent` | spawn | ✅ per call | fresh — zero parent context |
+| `subagent_fork` | fork | ❌ schema carries no `provider`/`model` | seeded with the parent's completed turns |
+| `workflow` `agent()` | spawn (worker thread) | ✅ per call | fresh; script-orchestrated |
+
+**Vocabulary — say which "provider".** The code's words: `SubagentProvider`
+(`spawn`/`fork`), `ctx.subagents` (the registry), the tool name, and the **LLM
+route** (`provider` + `model`). "Provider" alone is ambiguous — it names the
+child-creator in a tool's *config* and the model vendor in a tool *call*.
+
+- **Verified live 2026-09-12:** all four flash routes pinned on `subagent`; each
+  child quoted its own identity line verbatim and executed bash + read + glob.
+  `workflow` `agent()` pinned two routes and used tools — proved by having two
+  children write unique nonce files to disk, confirmed from the COS shell.
+- **`reasoning_effort` pinning is UNTESTED** — children do not report their
+  effort, so the identity check cannot confirm it. Test per route before relying
+  on it, especially `gpt-5.6-luna` (effort-value sensitive). `workflow`
+  `agent()` rejects `reasoning_effort` outright: effort pinning is
+  `subagent`-only.
+- **Model selection binds per session, at session start.** Enabling
+  `subagent-model-selection` mid-session — or restarting dsh and resuming an *old*
+  conversation — leaves the old tool schema in place, and the call fails with
+  `Error: child model selection is disabled for this tool instance`. The fix is a
+  **new conversation**; a restart is not enough.
+- **Steerability differs by door.** `subagent` and `subagent_fork` children are
+  `continuable` and answer `send_message`; `workflow` children are `one-shot` and
+  **cannot** be steered mid-run — re-dispatch instead.
+- The 2026-09-10 finding that `workflow` `agent()` children cannot use tools is
+  **retired**; both previously parked templates are runnable again.
+- Full architecture map, term mapping and GUI reading guide:
+  `~/Obsidian/AIML/dsh/dsh-subagent-architecture-2026-09-12.md`.
+
 ## 4. Brief discipline
 
 A delegated brief is **self-contained** — specialists never see the COS
@@ -146,6 +185,10 @@ managed process, and it is the direct answer to the "agents cannot coordinate
 in real time" objection: they can, through the COS. Use it rather than killing
 and re-dispatching a leg that drifted. Prefer `subagent_fork` when a leg needs
 this conversation's reasoning; plain `subagent` when the brief is self-contained.
+**Caveat (2026-09-12):** steering works only through the `continuable` doors —
+`subagent` and `subagent_fork`. `workflow` `agent()` children are `one-shot` and
+**cannot** be steered mid-run; re-dispatch those instead. See "Delegation doors"
+in §3.
 
 **Scratch convention.** Leg working files and drafts go in **`.scratch/`**
 (gitignored, ephemeral, safe to wipe). Persistent data artifacts — fetched
