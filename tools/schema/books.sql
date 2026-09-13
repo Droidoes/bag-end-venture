@@ -1,19 +1,41 @@
--- books.db schema — v0.2.4 (2026-09-08) · author: Roth (single-threaded, per ratified fix order)
+-- books.db schema — v0.2.5 (2026-09-12) · author: Roth (single-threaded, per ratified fix order)
 -- Requirement set: .scratch/schema-review/{CONVERGENCE,leg1-semantics,leg2-adversarial,leg3-purpose}.md
 -- Blueprint: docs/superpowers/plans/2026-09-07-schema-v0.2.md
+-- P0 blueprint: docs/superpowers/plans/2026-09-12-structural-prefetch-v0.3.md §2/§4/§5/§8
 -- METHOD ONLY: no financial values, no account numbers.
 --
 -- v0.2.4 (2026-09-08, tax-scan): tax_year_facts gains the return line items the
 -- Q2 marginal-rate work needs — taxable_income, total_tax, std_deduction,
 -- ss_wages, state_income_tax — all nullable REAL with typeof guards (additive only).
 --
+-- v0.2.5 (2026-09-12, structural pre-fetch P0): the presence vocabulary gains
+-- 'zero_from_blank' (a blank inside the ingest rectangle is a STATED zero, not a
+-- measurement). The four row-level state families — fact_state, holding_state,
+-- ss_earnings_annual, ss_benefit_estimates — carry presence + nullable origin +
+-- nullable error_type and a composite CHECK over the legal (origin, presence)
+-- pairs (blueprint §4, expanded conjunctively because SQLite forbids row-value IN
+-- inside CHECK). holding_state also gains the needs_verify it never had. src_column
+-- gains the column-grain derivation fields (origin, derivation_kind, formula_shape,
+-- copy_of, role) — nullable, additive; nothing has ever written to src_column, so
+-- there is no rebuild cost. ERRORS are represented as: canonical token (#NAME?,
+-- #REF!, ...) in value_text AND presence='error' AND error_type — fact_state's
+-- one-of value CHECK is deliberately UNCHANGED; value_text carrying the token
+-- satisfies it.
+--
 -- APPLICATION RULES
 --   * Apply to a FRESH store only. No IF NOT EXISTS anywhere: re-application fails
 --     loudly by design. Migration path is rebuild-from-Drive, never ALTER-in-place
 --     (the one sanctioned exception: v0.2.3 → v0.2.4 added the five tax line-item
 --     columns via ALTER, verified by sqlite_master parity against this script).
+--   * v0.2.5 is ADDITIVE-ALTER-able for its new COLUMNS, but it also WIDENS the
+--     presence CHECK and adds composite pair CHECKs. A CHECK change has no ALTER
+--     statement in SQLite — so an existing v0.2.4 store is migrated by REBUILDING
+--     each affected table (create new -> copy -> drop old -> rename -> recreate
+--     indexes), never by ALTER-in-place. The P0 parity harness must therefore
+--     compare a REBUILT table against a FRESHLY CREATED one (sqlite_master DDL +
+--     row data) — not against an ALTER diff.
 --   * Every connection MUST set PRAGMA foreign_keys=ON (per-connection in SQLite);
---     the loader asserts it plus _schema_meta.schema_version='v0.2.4' on connect.
+--     the loader asserts it plus _schema_meta.schema_version='v0.2.5' on connect.
 --
 -- IDENTITY MODEL (blueprint D1/D2)
 --   * natural_key: SOURCE-SCOPED business identity constructed at ingest
@@ -36,9 +58,13 @@
 --
 -- LOADER CONTRACT (enforced by the harness, not by comments):
 --   * content_hash recipe: H(account_id | metric_id | as_of | seq_in_date |
---     value_num | value_text) — ordinal IN, source identity OUT. Equal-valued
---     same-day pairs differ by ordinal and coexist; cross-source identical rows
---     collide on the partial UNIQUE index and are blocked (B1).
+--     value_num | value_text | presence | origin) — ordinal IN, source identity
+--     OUT. v0.2.5 CONTRACT CHANGE: presence and origin joined the recipe — under
+--     v0.2.4 a measured `0` and a zero_from_blank `0` hashed IDENTICALLY and were
+--     silently deduped, so a reclassification could never survive the re-ingest
+--     probe (blueprint §5). Equal-valued same-day pairs differ by ordinal and
+--     coexist; cross-source identical rows collide on the partial UNIQUE index and
+--     are blocked (B1).
 --   * A batch loads a COMPLETE slice (one tab of one source). Re-ingest, in ONE
 --     transaction: (1) mark every prior row of that slice superseded_by_batch_id,
 --     (2) apply src_tab.dedupe_rule across sources, logging to dedupe_log,
@@ -57,7 +83,7 @@ CREATE TABLE _schema_meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
-INSERT INTO _schema_meta(key, value) VALUES ('schema_version', 'v0.2.4');
+INSERT INTO _schema_meta(key, value) VALUES ('schema_version', 'v0.2.5');
 
 CREATE TABLE load_batch (
   batch_id     INTEGER PRIMARY KEY,
@@ -97,6 +123,8 @@ CREATE TABLE src_tab (
   CHECK ((header_state='confirmed') = (header_row IS NOT NULL AND header_row >= 1))
 );
 
+-- v0.2.5: derivation is a COLUMN-grain fact (blueprint §2) — these five fields are
+-- nullable and additive; nothing had ever written to src_column, so no rebuild cost.
 CREATE TABLE src_column (
   map_id          INTEGER PRIMARY KEY,
   tab_id          INTEGER NOT NULL REFERENCES src_tab ON DELETE RESTRICT,
@@ -106,6 +134,14 @@ CREATE TABLE src_column (
   account_id      INTEGER REFERENCES dim_account,
   metric_id       INTEGER REFERENCES dim_metric,
   unit            TEXT,
+  origin          TEXT CHECK (origin IS NULL OR origin IN ('entered','copy','constant_formula','derived','external','key')),
+  derivation_kind TEXT,   -- §4: a SET, not a partition — stored as a NORMALISED COMMA-SEPARATED
+                          -- STRING: lower-case tokens, alphabetically sorted, joined by ',' with no
+                          -- spaces (e.g. 'aggregate,chain'). Normalisation is the loader's job; the
+                          -- store keeps the canonical string and compares it verbatim.
+  formula_shape   TEXT,   -- masked structural shape of the column's formula (shape, never values)
+  copy_of         TEXT,   -- pure-reference lineage: the source cell/column this column copies (§4)
+  role            TEXT CHECK (role IS NULL OR role IN ('value','key','derived','external','copy','scratch')),
   UNIQUE (tab_id, col_index, header_occurrence)
 );
 -- NOTE: dim_account/dim_metric are created below; SQLite resolves FKs at runtime,
@@ -185,7 +221,9 @@ CREATE TABLE fact_state (
   sheet_row_number INTEGER,                          -- raw, verifiable (B4)
   value_num       REAL CHECK (value_num IS NULL OR typeof(value_num)='real'),
   value_text      TEXT,
-  presence        TEXT NOT NULL DEFAULT 'measured' CHECK (presence IN ('measured','estimated','error')),
+  presence        TEXT NOT NULL DEFAULT 'measured' CHECK (presence IN ('measured','estimated','zero_from_blank','error')),
+  origin          TEXT CHECK (origin IS NULL OR origin IN ('entered','copy','constant_formula','derived','external','key')),
+  error_type      TEXT,                              -- canonical error token (#NAME?, #REF!, ...) when presence='error'
   period_grain    TEXT NOT NULL CHECK (period_grain IN ('daily','near-daily','weekly','monthly','month-end','quarterly','annual','unknown')),
   grain_detail    TEXT,                              -- 'Friday-anchored', 'bridge', 'mixed monthly to weekly' …
   event_group_id  INTEGER CHECK (event_group_id IS NULL OR event_group_id > 0),  -- same-day event chains (TIPS pair): delta between rows is derivable
@@ -197,7 +235,33 @@ CREATE TABLE fact_state (
   superseded_by_batch_id INTEGER REFERENCES load_batch ON DELETE SET NULL,
   ingested_at     TEXT NOT NULL,
   UNIQUE (natural_key, batch_id),
-  CHECK ((value_num IS NULL) <> (value_text IS NULL))
+  -- ERROR REPRESENTATION (§5): an errored cell puts its canonical token (#NAME?,
+  -- #REF!, ...) in value_text AND sets presence='error' AND error_type. The one-of
+  -- value CHECK below is deliberately UNCHANGED by v0.2.5 — value_text carrying the
+  -- token satisfies it; no error row is unrepresentable any more.
+  CHECK ((value_num IS NULL) <> (value_text IS NULL)),
+  -- LEGAL (origin, presence) PAIRS — blueprint §4, encoded as an explicit list of
+  -- expanded conjuncts (SQLite forbids row-value IN inside a CHECK). `key` carries
+  -- NO pair: a key column is row addressing, never a fact row. (external,'error')
+  -- is absent: §4 maps errored formulas to origin='derived'. The same list lives in
+  -- loader21.LEGAL_ORIGIN_PRESENCE_PAIRS and is enforced at load time too, because
+  -- origin's column-grain default lives on src_column while presence is row-grain —
+  -- a cross-table rule SQL cannot see. P0 harness keeps the two lists equal.
+  CONSTRAINT ck_fact_state_origin_presence CHECK (
+    origin IS NULL OR presence IS NULL
+    OR (origin='entered' AND presence='measured')
+    OR (origin='entered' AND presence='zero_from_blank')
+    OR (origin='constant_formula' AND presence='measured')
+    OR (origin='copy' AND presence='measured')
+    OR (origin='copy' AND presence='zero_from_blank')
+    OR (origin='copy' AND presence='estimated')
+    OR (origin='copy' AND presence='error')
+    OR (origin='derived' AND presence='estimated')
+    OR (origin='derived' AND presence='error')
+    OR (origin='external' AND presence='measured')
+    OR (origin='external' AND presence='estimated')
+    OR (origin='external' AND presence='error')
+  )
 );
 CREATE UNIQUE INDEX ux_fact_state_hash ON fact_state (content_hash) WHERE superseded_by_batch_id IS NULL;
 -- PARTIAL (superseded-aware): marked rows leave the index before the replacement batch
@@ -274,13 +338,33 @@ CREATE TABLE ss_earnings_annual (
   medicare_rate   REAL CHECK (medicare_rate IS NULL OR typeof(medicare_rate)='real'),
   medicare_addl_rate REAL CHECK (medicare_addl_rate IS NULL OR typeof(medicare_addl_rate)='real'),
   fica_total      REAL CHECK (fica_total IS NULL OR typeof(fica_total)='real'),  -- source-carried derived sum; cross-check only, never merged
+  presence        TEXT NOT NULL DEFAULT 'measured' CHECK (presence IN ('measured','estimated','zero_from_blank','error')),
+  origin          TEXT CHECK (origin IS NULL OR origin IN ('entered','copy','constant_formula','derived','external','key')),
+  error_type      TEXT,                              -- canonical error token when presence='error' (v0.2.5)
   needs_verify    INTEGER NOT NULL DEFAULT 0 CHECK (needs_verify IN (0,1)),
   verify_note     TEXT,
   source_id       INTEGER NOT NULL REFERENCES src_ref ON DELETE RESTRICT,
   batch_id        INTEGER NOT NULL REFERENCES load_batch ON DELETE RESTRICT,
   superseded_by_batch_id INTEGER REFERENCES load_batch ON DELETE SET NULL,
   ingested_at     TEXT NOT NULL,
-  UNIQUE (natural_key, batch_id)
+  UNIQUE (natural_key, batch_id),
+  -- v0.2.5 legal (origin, presence) pairs — §4 list, literally identical to
+  -- ck_fact_state_origin_presence (the P0 harness asserts both DDL and semantics).
+  CONSTRAINT ck_ss_earnings_origin_presence CHECK (
+    origin IS NULL OR presence IS NULL
+    OR (origin='entered' AND presence='measured')
+    OR (origin='entered' AND presence='zero_from_blank')
+    OR (origin='constant_formula' AND presence='measured')
+    OR (origin='copy' AND presence='measured')
+    OR (origin='copy' AND presence='zero_from_blank')
+    OR (origin='copy' AND presence='estimated')
+    OR (origin='copy' AND presence='error')
+    OR (origin='derived' AND presence='estimated')
+    OR (origin='derived' AND presence='error')
+    OR (origin='external' AND presence='measured')
+    OR (origin='external' AND presence='estimated')
+    OR (origin='external' AND presence='error')
+  )
 );
 -- medicare_only is DERIVED (medicare_taxed - ss_taxed): never stored.
 
@@ -307,13 +391,33 @@ CREATE TABLE ss_benefit_estimates (
   amount        REAL NOT NULL CHECK (typeof(amount)='real'),
   unit          TEXT NOT NULL CHECK (unit IN ('monthly','annual')),
   is_estimate   INTEGER NOT NULL CHECK (is_estimate IN (0,1)),   -- no default: loader must decide (finding 18)
+  presence      TEXT NOT NULL DEFAULT 'measured' CHECK (presence IN ('measured','estimated','zero_from_blank','error')),
+  origin        TEXT CHECK (origin IS NULL OR origin IN ('entered','copy','constant_formula','derived','external','key')),
+  error_type    TEXT,                              -- canonical error token when presence='error' (v0.2.5)
   basis_date    TEXT CHECK (basis_date IS NULL OR (basis_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date(basis_date) = basis_date)),
   needs_verify  INTEGER NOT NULL DEFAULT 0 CHECK (needs_verify IN (0,1)),
   source_id     INTEGER NOT NULL REFERENCES src_ref ON DELETE RESTRICT,
   batch_id      INTEGER NOT NULL REFERENCES load_batch ON DELETE RESTRICT,
   superseded_by_batch_id INTEGER REFERENCES load_batch ON DELETE SET NULL,
   ingested_at   TEXT NOT NULL,
-  UNIQUE (natural_key, batch_id)
+  UNIQUE (natural_key, batch_id),
+  -- v0.2.5 legal (origin, presence) pairs — §4 list, literally identical to
+  -- ck_fact_state_origin_presence (the P0 harness asserts both DDL and semantics).
+  CONSTRAINT ck_ss_benefit_origin_presence CHECK (
+    origin IS NULL OR presence IS NULL
+    OR (origin='entered' AND presence='measured')
+    OR (origin='entered' AND presence='zero_from_blank')
+    OR (origin='constant_formula' AND presence='measured')
+    OR (origin='copy' AND presence='measured')
+    OR (origin='copy' AND presence='zero_from_blank')
+    OR (origin='copy' AND presence='estimated')
+    OR (origin='copy' AND presence='error')
+    OR (origin='derived' AND presence='estimated')
+    OR (origin='derived' AND presence='error')
+    OR (origin='external' AND presence='measured')
+    OR (origin='external' AND presence='estimated')
+    OR (origin='external' AND presence='error')
+  )
 );
 
 CREATE TABLE ss_cola (
@@ -606,6 +710,9 @@ END;
 -- Per-security position SNAPSHOTS from the Trading-Performance Data tabs
 -- (2022-2026; earlier years live in the statement archive). Lot-level detail
 -- from statements remains a separate, deferred pass.
+-- v0.2.5: this family carried NEITHER presence NOR needs_verify — both added here
+-- (presence with the extended CHECK and the same DEFAULT 'measured'; needs_verify
+-- uniform with every other fact family, U-5), plus origin/error_type per §4/§5.
 CREATE TABLE holding_state (
   holding_id   INTEGER PRIMARY KEY,
   natural_key  TEXT NOT NULL,
@@ -617,11 +724,32 @@ CREATE TABLE holding_state (
   market_value REAL CHECK (market_value IS NULL OR typeof(market_value)='real'),
   price        REAL CHECK (price IS NULL OR typeof(price)='real'),
   purchase_date TEXT CHECK (purchase_date IS NULL OR (purchase_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND date(purchase_date) = purchase_date)),
+  presence       TEXT NOT NULL DEFAULT 'measured' CHECK (presence IN ('measured','estimated','zero_from_blank','error')),
+  origin         TEXT CHECK (origin IS NULL OR origin IN ('entered','copy','constant_formula','derived','external','key')),
+  error_type     TEXT,                              -- canonical error token when presence='error' (v0.2.5)
+  needs_verify   INTEGER NOT NULL DEFAULT 0 CHECK (needs_verify IN (0,1)),
   source_id    INTEGER NOT NULL REFERENCES src_ref ON DELETE RESTRICT,
   batch_id     INTEGER NOT NULL REFERENCES load_batch ON DELETE RESTRICT,
   superseded_by_batch_id INTEGER REFERENCES load_batch ON DELETE SET NULL,
   ingested_at  TEXT NOT NULL,
-  UNIQUE (natural_key, batch_id)
+  UNIQUE (natural_key, batch_id),
+  -- v0.2.5 legal (origin, presence) pairs — §4 list, literally identical to
+  -- ck_fact_state_origin_presence (the P0 harness asserts both DDL and semantics).
+  CONSTRAINT ck_holding_state_origin_presence CHECK (
+    origin IS NULL OR presence IS NULL
+    OR (origin='entered' AND presence='measured')
+    OR (origin='entered' AND presence='zero_from_blank')
+    OR (origin='constant_formula' AND presence='measured')
+    OR (origin='copy' AND presence='measured')
+    OR (origin='copy' AND presence='zero_from_blank')
+    OR (origin='copy' AND presence='estimated')
+    OR (origin='copy' AND presence='error')
+    OR (origin='derived' AND presence='estimated')
+    OR (origin='derived' AND presence='error')
+    OR (origin='external' AND presence='measured')
+    OR (origin='external' AND presence='estimated')
+    OR (origin='external' AND presence='error')
+  )
 );
 CREATE INDEX ix_holding_state ON holding_state (account_id, security_id, as_of);
 

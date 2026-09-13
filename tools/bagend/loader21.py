@@ -2,9 +2,12 @@
 
 Implements: batch identity + atomicity · source-scoped natural keys ·
 supersede-then-insert (whole-tab scope) · per-source dedupe rules ·
-content_hash recipe H(account|metric|as_of|ordinal|value) for state ·
+content_hash recipe H(account|metric|as_of|ordinal|value|presence|origin) for state
+(v0.2.5: presence+origin joined the recipe — see state_content_hash) ·
 row_order-aware seq derivation · strict date roundtrip · UNMAPPED sentinels ·
-schema-version + foreign_keys assertion on connect.
+schema-version + foreign_keys assertion on connect · legal (origin, presence)
+pair enforcement (blueprint v0.3 §4; SQL composite CHECK sees only row-grain
+values, origin's column-grain default lives on src_column, so the loader asserts).
 
 Curation (what loads, and how each column maps) lives in
 private/curation/*.json — this module is method only.
@@ -22,8 +25,46 @@ from pathlib import Path
 
 from . import config
 
-SCHEMA_VERSION = "v0.2.4"
+SCHEMA_VERSION = "v0.2.5"
 TOOL_VERSION = "loader21.py"
+
+# ---------------------------------------------------------------- §4 semantics contract
+PRESENCE_VALUES = ("measured", "estimated", "zero_from_blank", "error")
+ORIGIN_VALUES = ("entered", "copy", "constant_formula", "derived", "external", "key")
+# Legal (origin, presence) row pairs — blueprint v0.3 §4, the mirror of the composite
+# CHECKs in books.sql (ck_*_origin_presence). `key` has no pair: a key column is row
+# addressing, never a fact row. (external,'error') is absent: §4 maps errored
+# formulas to origin='derived'. Books.sql cannot enforce the COLUMN-grain default
+# (src_column.origin) against the ROW-grain presence, so the loader asserts too.
+LEGAL_ORIGIN_PRESENCE_PAIRS = frozenset({
+    ("entered", "measured"), ("entered", "zero_from_blank"),
+    ("constant_formula", "measured"),
+    ("copy", "measured"), ("copy", "zero_from_blank"), ("copy", "estimated"), ("copy", "error"),
+    ("derived", "estimated"), ("derived", "error"),
+    # external_links membership OVERRIDES kind (blueprint v0.3 §4 precedence): a
+    # declared-external column carries measured literals, estimated results, and
+    # errors from a failed cross-sheet pull. Restricting external to 'estimated'
+    # made the Taxes E/H case (literal values in an external column) unstorable.
+    ("external", "measured"), ("external", "estimated"), ("external", "error"),
+})
+
+
+def legal_pair(origin, presence) -> bool:
+    """Pure predicate, unit-testable: may a row carrying `origin` also carry
+    `presence`? NULL on either side means 'not asserted at write time' and passes —
+    the same guard the SQL composite CHECK carries."""
+    if origin is None or presence is None:
+        return True
+    return (origin, presence) in LEGAL_ORIGIN_PRESENCE_PAIRS
+
+
+def require_legal_pair(origin, presence, where: str) -> None:
+    """Load-time assertion of §4's legal pairs; raises instead of inserting."""
+    if not legal_pair(origin, presence):
+        raise LoadError(
+            f"illegal (origin, presence) pair ({origin!r}, {presence!r}) at {where}; "
+            f"legal pairs are {sorted(LEGAL_ORIGIN_PRESENCE_PAIRS)} (blueprint v0.3 §4)"
+        )
 
 
 class LoadError(Exception):
@@ -112,6 +153,32 @@ def coerce_num(v) -> tuple[float | None, str | None]:
 
 def make_hash(*parts) -> str:
     return hashlib.sha256("|".join(str(p) for p in parts).encode("utf-8")).hexdigest()
+
+
+def state_content_hash(account_id, metric_id, as_of, seq, value, presence, origin) -> str:
+    """The v0.2.5 state recipe: H(account|metric|as_of|ordinal|value|presence|origin).
+
+    CONTRACT CHANGE (blueprint v0.3 §5): presence and origin are now INSIDE the hash.
+    Under v0.2.4 a measured `0` and a `zero_from_blank` `0` hashed IDENTICALLY — the
+    dedupe probe below found the existing row and the reclassified row was SILENTLY
+    DEDUPED. Including them in the recipe is what makes the two zeros distinguishable
+    in the store, not just in comments. NULL presence/origin stringify as 'None' —
+    stable and distinct from every concrete value."""
+    return make_hash(account_id, metric_id, as_of, seq, value, presence, origin)
+
+
+def column_origin(conn: sqlite3.Connection, source_id: int, tab: str, header_text: str) -> str | None:
+    """Column-grain origin default from src_column (§2: derivation lives on the
+    column, not the row). Nothing has ever written src_column, so today this reads
+    as 'no curated default'; the P1+ structural loaders will populate it."""
+    row = conn.execute(
+        """SELECT c.origin FROM src_column c
+             JOIN src_tab t ON t.tab_id = c.tab_id
+            WHERE t.source_id = ? AND t.tab = ? AND c.header_text = ? AND c.origin IS NOT NULL
+            ORDER BY c.map_id LIMIT 1""",
+        (source_id, tab, header_text),
+    ).fetchone()
+    return None if row is None else row[0]
 
 
 def load_curation(path: Path) -> dict:
@@ -310,13 +377,26 @@ def load_state_spine(conn: sqlite3.Connection, batch: Batch, spec: dict, acct_id
                 acct = acct_ids[mapping["account"]]
                 met = metric_ids[mapping["metric"]]
                 grain = mapping.get("grain", "month-end")
+                # v0.2.5 §4 row semantics. The CSV path only ever sees coerced
+                # literals (blank cells are skipped before this point, so
+                # zero_from_blank cannot arise here — it needs the P1 artifact
+                # rectangle). origin resolution: classified cell (curation `origin`)
+                # > column-grain src_column.origin default > 'entered' (a literal).
+                presence = "measured"
+                origin = mapping.get("origin") or column_origin(conn, source_id, spec["tab"], col) or "entered"
+                # Legal-pair assertion: the SQL composite CHECK can only see row-grain
+                # values; origin's default lives on src_column, so enforce the §4 rule
+                # here too and fail loudly rather than insert an unmapped state.
+                require_legal_pair(origin, presence, f"row {rowno} col {col!r}")
                 key = (acct, met, as_of)
                 seq = seq_buf.get(key, 0) + 1
                 seq_buf[key] = seq
                 nk = f"{source_id}|{acct}|{met}|{as_of}|{seq}"
-                h = make_hash(acct, met, as_of, seq, val)
+                h = state_content_hash(acct, met, as_of, seq, val, presence, origin)
                 if conn.execute("SELECT 1 FROM fact_state WHERE content_hash=?", (h,)).fetchone():
-                    # identical content already current — skip WITHOUT superseding it
+                    # identical content already current — skip WITHOUT superseding it.
+                    # v0.2.5: 'identical' now includes presence+origin (they are in the
+                    # hash), so a reclassification is never silently deduped again.
                     n_skipped += 1
                     continue
                 # replace prior versions of this business key from the SAME source
@@ -328,10 +408,10 @@ def load_state_spine(conn: sqlite3.Connection, batch: Batch, spec: dict, acct_id
                     n_sup += 1
                 conn.execute(
                     """INSERT INTO fact_state(natural_key, account_id, metric_id, as_of, seq_in_date,
-                       sheet_row_number, value_num, presence, period_grain, grain_detail,
+                       sheet_row_number, value_num, presence, origin, period_grain, grain_detail,
                        content_hash, source_id, batch_id, ingested_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (nk, acct, met, as_of, seq, rowno, val, "measured", grain, spec.get("grain"),
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (nk, acct, met, as_of, seq, rowno, val, presence, origin, grain, spec.get("grain"),
                      h, source_id, batch.batch_id, now()),
                 )
                 n += 1
@@ -347,6 +427,9 @@ def load_state_spine(conn: sqlite3.Connection, batch: Batch, spec: dict, acct_id
             acct = acct_ids[mapping["account"]]
             met = metric_ids[mapping["metric"]]
             grain = mapping.get("grain", "month-end")
+            # a reconstructed-by-difference value is a derivation, never a measurement
+            d_presence, d_origin = "estimated", "derived"
+            require_legal_pair(d_origin, d_presence, f"derived column {mapping['col']!r}")
             for as_of, (measured_sum, src_total) in sorted(row_totals.items()):
                 delta = src_total - measured_sum
                 if abs(delta) <= 0.01:
@@ -354,18 +437,18 @@ def load_state_spine(conn: sqlite3.Connection, batch: Batch, spec: dict, acct_id
                 seq = seq_buf.get((acct, met, as_of), 0) + 1
                 seq_buf[(acct, met, as_of)] = seq
                 nk = f"{source_id}|{acct}|{met}|{as_of}|{seq}"
-                h = make_hash(acct, met, as_of, seq, delta)
+                h = state_content_hash(acct, met, as_of, seq, delta, d_presence, d_origin)
                 conn.execute(
                     """INSERT INTO fact_state(natural_key, account_id, metric_id, as_of, seq_in_date,
-                       sheet_row_number, value_num, presence, period_grain, grain_detail,
+                       sheet_row_number, value_num, presence, origin, period_grain, grain_detail,
                        verify_note, content_hash, source_id, batch_id, ingested_at)
-                       VALUES (?,?,?,?,?,NULL,?,'estimated',?,?,?,?,?,?,?)""",
-                    (nk, acct, met, as_of, seq, delta, grain, spec.get("grain"),
+                       VALUES (?,?,?,?,?,NULL,?,?,?,?,?,?,?,?,?,?)""",
+                    (nk, acct, met, as_of, seq, delta, d_presence, d_origin, grain, spec.get("grain"),
                      mapping.get("note"), h, source_id, batch.batch_id, now()),
                 )
                 n += 1
         if derived_cols and row_totals:
-            issues.append(f"derived: {len(derived_cols)} column(s) reconstructed by difference; presence='estimated'")
+            issues.append(f"derived: {len(derived_cols)} column(s) reconstructed by difference; presence='estimated', origin='derived'")
         if max_total_delta > 0.01 and not derived_cols:
             issues.append(f"cross-check: max |SUM(accounts) - source Total Assets| = {max_total_delta:.2f}")
         if n_skipped:
