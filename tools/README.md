@@ -72,9 +72,39 @@ python3 tools/bagend.py inspect private/raw/2019-Trading-Performance.xlsx --md
 python3 tools/bagend.py ingest xlsx private/raw/2019-Trading-Performance.xlsx \
         Performance pnl_2019 --skiprows 0 --note "initial backfill"
 
-# 7. Query
+# 7. Query (read gate: see "Store schema gate" below)
 python3 tools/bagend.py query "SELECT * FROM _ingest_log"
+
+# 8. Export the dashboard payload (defaults to the live store)
+python3 tools/bagend.py export finpage
+python3 tools/bagend.py export finpage --db private/books-shadow.db   # smoke a shadow
 ```
+
+## Store schema gate — split by intent, not weakened
+
+`loader21.assert_schema(conn, mode=...)` has two modes:
+
+- **`mode="write"`** (load/ingest) — requires an **exact** `SCHEMA_VERSION` match. A
+  loader writing into an older store is the dangerous case, and it stays refused.
+- **`mode="read"`** (query/export) — also accepts the pre-migration whitelist in
+  `loader21.READ_COMPATIBLE_SCHEMA_VERSIONS`, and prints a loud stderr warning
+  naming the version. An unknown version is refused by both modes: the read set is
+  a whitelist, never "anything".
+
+Why the split exists: the live store is legitimately `v0.2.4` while the toolkit was
+`v0.2.6`, and the live store **cannot** be rebuilt mid-migration — the shadow holds
+only the first wave, so promoting it would drop cost basis, SSA, checking/card and
+events. Without the split, the dashboard exporter simply broke. With it, reads keep
+working and say plainly that they are reading pre-migration figures.
+
+**The read entries are TEMPORARY.** Drop `"v0.2.5"` and `"v0.2.4"` at the P3 cutover
+so reads become exact too — otherwise "compatible" quietly degrades into "any old
+store may be read", which is not a gate at all.
+
+A pre-migration read publishes a **pre-migration figure**: on `v0.2.4` the
+`v_net_worth` view is the older definition, so its `total` still sums `copy` and
+`error` rows and its `n_error` means `value_num IS NULL`. The exporter stamps the
+schema it read, so a stale figure is traceable rather than silent.
 
 ## Conventions
 

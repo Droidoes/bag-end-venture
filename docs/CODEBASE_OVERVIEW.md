@@ -186,3 +186,34 @@ analysis.
   (`group_row`, `sub_header_row`, `first_data_row`, `skip_rows`,
   `derived_columns`, `external_links`) exist only in the allow-list, which
   `loader21` never reads.
+- **2026-09-12 (Roth, structural-prefetch day)** — the ingest path stops
+  laundering derived values as measurements. A structure-only audit of all 11
+  ingest specs found **8 inadequate + 1 marginal**: they read tabs where
+  formula-derived cells are pervasive (one tab is 97.8% formulas), and a
+  values-only CSV cannot tell a derived cell from a measured one. The first
+  sweep understated the largest tab because it read an 80-row window and
+  published partial counts as measurements — corrected in place, and **coverage
+  is now an asserted property of every structural read** (charter v1.0.2).
+  Blueprint **v0.3** consolidated five revisions and two review rounds (three
+  flash legs, four pro reviewers — three rejections) into one executable
+  contract; the build then landed in slices, each with a **fail-before** check:
+  **P1** `sheets snapshot` (the structural artifact: values plus formulas,
+  merges, number formats, errors, explicit blanks, asserted coverage);
+  **P0** schema **v0.2.5** (`presence` gains `zero_from_blank`; `origin`,
+  `derivation_kind`, `error_type`; `content_hash` now includes presence and
+  origin, so a measured 0 and a `zero_from_blank` 0 no longer hash identically
+  and silently dedupe); **P2** a structural load into a **fresh empty shadow**
+  (never a copy of the live store) with `src_column` written for the first time;
+  **DM-2026-01** blank semantics — a blank in a live row means 0, except where a
+  column declares `blank_means='not_applicable'`, with per-column `series_start`
+  and `series_anchor_month`; **Slice B** presence-aware views (additive totals
+  exclude `copy` and `error`, `n_error` corrected to `presence='error'`); and
+  **E5b** real column shape assertions (a renamed header or a shifted frame now
+  quarantines instead of loading the wrong figures into the wrong metrics).
+  `private/books.db` was never touched. The honest headline of the day is
+  methodological: **five separate checks were found that could not fail, or
+  could not fire for the thing they named** — an offline battery passing 95/95
+  while every live call 400'd, a diff reporting "bug 0" because divergence was
+  pre-declared, vacuous shape assertions, a guard with no expectations to test
+  against, and an unarmed anchor for `Deposit`. Each was found by trying to make
+  the check fail, not by reading a green report.
