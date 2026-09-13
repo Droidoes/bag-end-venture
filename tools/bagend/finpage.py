@@ -4,6 +4,17 @@ Queries private/books.db and emits ONE JSON bundle (no numbers ever committed;
 the bundle is written only to local data dirs) for the static BagEnd.html
 viewer. Mirrors the Homepage-projects pattern: hosted page + locally-connected
 data file.
+
+CONSUMER CONTRACT (2026-09-13): this module is a READ path. `export finpage` runs
+under `loader21.assert_schema(con, mode="read")`, so it keeps serving the page
+while the live store is still pre-migration — which means every column it selects
+must exist on every version in
+`loader21.READ_COMPATIBLE_SCHEMA_VERSIONS`. Selecting a v0.2.6-only column here
+(`n_copy`, `composition_class`, `fact_state.origin`, …) silently re-breaks the
+dashboard against the live store: `v_net_worth` is read for `as_of`, `metric_id`
+and `total` only, which hold all the way back to v0.2.4. If this page ever
+genuinely needs a newer column, the fix is the migration, not the gate — promote
+the store rather than reading a figure it cannot supply.
 """
 from __future__ import annotations
 
@@ -83,11 +94,18 @@ def _a_max(balance: float, yield_: float, ss_schedule: dict, start_year: int) ->
 
 def build_payload(con: sqlite3.Connection) -> dict:
     con.row_factory = sqlite3.Row
+    # v_net_worth.total is additive-only (Slice B): a group whose rows are ALL copies
+    # or errors publishes NULL, never 0 — "unknown is not zero". This page's anchor
+    # balance is therefore the most recent group that HAS an additive total; a NULL
+    # group is not a balance, and `series` below has always dropped NULL points. The
+    # as_of travels with the payload, so which month's total was used is visible.
     bal = con.execute("""SELECT total, as_of FROM v_net_worth WHERE metric_id=
                          (SELECT metric_id FROM dim_metric WHERE name='TOTAL_ASSETS')
+                         AND total IS NOT NULL
                          ORDER BY as_of DESC LIMIT 1""").fetchone()
     if bal is None:
-        raise SystemExit("no net-worth data")
+        raise SystemExit("no additive net-worth total in store (every group is "
+                         "all-copy/all-error, or none was loaded)")
 
     series = con.execute("""SELECT as_of, total FROM v_net_worth WHERE metric_id=
                             (SELECT metric_id FROM dim_metric WHERE name='TOTAL_ASSETS')
@@ -139,6 +157,7 @@ def build_payload(con: sqlite3.Connection) -> dict:
     top = [dict(r) for r in con.execute("""SELECT s.ticker AS symbol, ROUND(SUM(h.market_value),2) AS market_value,
         ROUND(100.0 * SUM(h.market_value) / (SELECT total FROM v_net_worth WHERE metric_id=
         (SELECT metric_id FROM dim_metric WHERE name='TOTAL_ASSETS')
+        AND total IS NOT NULL
         ORDER BY as_of DESC LIMIT 1), 1) AS weight_pct
         FROM v_holding_current h JOIN dim_security s ON s.security_id = h.security_id
         GROUP BY s.ticker ORDER BY 2 DESC LIMIT 8""").fetchall()]

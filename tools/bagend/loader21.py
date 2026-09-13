@@ -5,7 +5,9 @@ supersede-then-insert (whole-tab scope) · per-source dedupe rules ·
 content_hash recipe H(account|metric|as_of|ordinal|value|presence|origin) for state
 (v0.2.5: presence+origin joined the recipe — see state_content_hash) ·
 row_order-aware seq derivation · strict date roundtrip · UNMAPPED sentinels ·
-schema-version + foreign_keys assertion on connect · legal (origin, presence)
+schema-version + foreign_keys assertion on connect (write mode demands an exact
+match; read mode accepts the whitelisted pre-migration versions and warns — see
+READ_COMPATIBLE_SCHEMA_VERSIONS) · legal (origin, presence)
 pair enforcement (blueprint v0.3 §4; SQL composite CHECK sees only row-grain
 values, origin's column-grain default lives on src_column, so the loader asserts).
 
@@ -36,6 +38,30 @@ per-column coverage table: those years are folded into the first stated point
 and are genuinely N/A. At or after the start the guard is unchanged — a blank
 anchor still fails the load loudly.
 
+Per-column shape (§E4 assertions made REAL by §E5b declarations): the allow-list tab
+entry declares `columns`, keyed by LETTER — letter -> {expected_label, role}, role from
+the src_column.role vocabulary, and NEVER metric_id (v0.3 §D-4: metric binding lives in
+the curation spec). `src_column.role` is DECLARATIVE and is written from that
+declaration (v0.2.6, COS ruling 2026-09-12): it answers "what is this column FOR",
+while `origin`/`derivation_kind` carry the OBSERVED per-cell facts. Before v0.2.6 the
+column's role was computed from origin precedence, so a column declared `value` whose
+cells merely happen to be formula-heavy (stats D/E) recorded `derived` — two fields
+under one name answering two questions. Before any spec loads,
+`assert_column_declarations` requires the
+declaration/artifact bijection both ways (every mapped column declared; every label the
+artifact carries declared), requires each declared letter's header cell at `header_row`
+to carry the declared label (`null` = must carry NO label), and requires the column's
+OBSERVED character — kind counts over the rectangle's live rows, never a value — to be
+consistent with the declared role. A `derived` column's derivation may instead be
+STATED in curation (`mode: derive_from_delta`); an `external` column's may be stated by
+`external_links`; a column with no observations contradicts nothing (blanks are
+DM-2026-01's business). Findings quarantine the spec through §7's visible path
+(`column-undeclared` / `column-label-mismatch` / `column-role-mismatch` ->
+coverage_calendar not-loaded + load_batch.status='partial'); a malformed declaration is
+a curation bug and raises LoadError instead. Each load prints the per-column `column
+shape` report so the assertions are seen to have run — a check nobody can see run is a
+check nobody can trust.
+
 Curation (what loads, and how each column maps) lives in
 private/curation/*.json — this module is method only.
 """
@@ -47,13 +73,62 @@ import hashlib
 import json
 import re
 import sqlite3
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
 
-SCHEMA_VERSION = "v0.2.5"
+SCHEMA_VERSION = "v0.2.6"
 TOOL_VERSION = "loader21.py"
+
+# ------------------------------------------------------- read-mode compatibility set
+# The versions a READ-ONLY consumer may use while a live store waits for its
+# migration. This is a WHITELIST, not "anything except current": a version that is
+# not listed here is refused in BOTH modes, so a half-applied, invented or future
+# schema can never be mistaken for something the toolkit understands.
+#
+# Why each member is compatible for readers — the claim is about SHAPE (every
+# surface a reader requires exists and means the same thing), never about values:
+#   v0.2.6  the current version. Exact match; the read path passes silently.
+#   v0.2.5  v0.2.6 changed VIEW DDL only (Slice B) — no table changed. `fact_state`
+#           and `dim_metric` are column-identical; `v_net_worth` keeps `as_of`,
+#           `metric_id` and `total`. v0.2.6 only ADDS columns to the read views
+#           (composition_class / is_additive / n_measured / n_copy /
+#           n_zero_from_blank / n_additive* on v_net_worth; origin / error_type /
+#           presence-derived fields on v_state_current and v_holding_current).
+#           Absent, not wrong. A reader that requires an added column is broken on
+#           such a store and must fail at its own query — assert_schema only
+#           certifies that the version is legible.
+#           Note that 'a v0.2.5 store' exists in TWO shapes: the Slice B view
+#           rewrite was committed under the v0.2.5 stamp, so a store built from
+#           that script already carries the composition columns while still
+#           reporting v0.2.5 — the exact half-migration the bump to v0.2.6 was
+#           created to expose. It is read-compatible either way: the difference
+#           between the two shapes is a column a reader must not require.
+#   v0.2.4  additionally predates the v0.2.5 table changes: origin / error_type /
+#           needs_verify arrived as ADDITIVE columns and the presence CHECK was
+#           WIDENED. Every row a v0.2.4 store holds already satisfies the v0.2.6
+#           vocabulary, and the columns a v0.2.4 store lacks are the same ones
+#           v0.2.5 lacks. Readable — still not writable.
+#
+# What this set does NOT claim: that the NUMBERS agree. v0.2.4 — and any v0.2.5
+# store built before the Slice B rewrite — `v_net_worth.total` sums every component
+# of a group; the current view excludes `copy` and `error` rows ("unknown is not
+# zero"). A pre-migration read therefore publishes a pre-migration figure — which is
+# why read mode WARNs on every non-current store instead of passing silently, and
+# why the store must still be promoted (the 2026-09-13 reason it could not be: the
+# shadow held only the first wave, so promoting it would have dropped cost basis,
+# SSA, checking/card and events).
+#
+# Membership is added deliberately, one migration at a time: a version joins only
+# after someone has checked the surfaces above against it. SCHEMA_VERSION is
+# listed by reference so the set tracks a bump; when a bump lands, re-justify the
+# entry it displaces rather than letting the set grow by accident.
+# REMOVAL IS PART OF THE SAME DISCIPLINE: these entries are TEMPORARY and exist
+# only while the live store is pre-migration. At the P3 cutover, drop "v0.2.5"
+# and "v0.2.4" so the read gate becomes exact as well.
+READ_COMPATIBLE_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION, "v0.2.5", "v0.2.4"})
 
 # ---------------------------------------------------------------- §4 semantics contract
 PRESENCE_VALUES = ("measured", "estimated", "zero_from_blank", "error")
@@ -102,15 +177,48 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def assert_schema(conn: sqlite3.Connection) -> None:
+def assert_schema(conn: sqlite3.Connection, *, mode: str = "write") -> None:
+    """Guard the store a caller is about to use. Two different questions, one gate:
+
+    mode="write" (default) — may this connection MUTATE the store? Only an exact
+      `SCHEMA_VERSION` match. The loader/ingest path keeps demanding this: an INSERT
+      aimed at an older table or view definition is a corrupt store, not a degraded
+      read, and a half-migrated write is the failure mode the version stamp exists
+      to prevent.
+    mode="read"  — may this connection only READ the store? An exact match, or any
+      member of READ_COMPATIBLE_SCHEMA_VERSIONS, with a one-line WARNING naming the
+      version and the fact that the store is pre-migration. This is what keeps a
+      read-only consumer (the finpage export, `query`) serving the owner's live
+      dashboard while the store waits for a migration it cannot yet be given.
+
+    Both modes refuse a connection with `foreign_keys` OFF, a store whose version
+    row cannot be read, and — since the read set is a whitelist — any version that
+    is not listed. An unknown `mode` raises rather than quietly defaulting.
+    """
+    if mode not in ("write", "read"):
+        raise LoadError(f"unknown assert_schema mode {mode!r}; expected 'write' or 'read'")
     fk = conn.execute("PRAGMA foreign_keys").fetchone()[0]
     if not fk:
         raise LoadError("PRAGMA foreign_keys is OFF on this connection — refusing to load")
     row = conn.execute("SELECT value FROM _schema_meta WHERE key='schema_version'").fetchone()
     # row-factory agnostic: tuple rows and sqlite3.Row both compare by value here
     found = None if row is None else row[0]
-    if found != SCHEMA_VERSION:
-        raise LoadError(f"store schema is {found!r}, expected {SCHEMA_VERSION} — apply tools/schema/books.sql to a fresh store")
+    if found == SCHEMA_VERSION:
+        return
+    if mode == "read":
+        if found not in READ_COMPATIBLE_SCHEMA_VERSIONS:
+            raise LoadError(
+                f"store schema is {found!r}: not the current {SCHEMA_VERSION} and not in the "
+                f"READ-COMPATIBLE set {sorted(READ_COMPATIBLE_SCHEMA_VERSIONS)} — this store is "
+                f"not legible to a reader either; apply tools/schema/books.sql to a fresh store"
+            )
+        print(f"WARNING: store schema is {found!r} but the toolkit is {SCHEMA_VERSION} — "
+              f"PRE-MIGRATION store, READ ONLY: its views may lack the newer composition "
+              f"columns and its totals may predate Slice B, so figures read from this "
+              f"store are pre-migration figures (see READ_COMPATIBLE_SCHEMA_VERSIONS, "
+              f"tools/bagend/loader21.py)", file=sys.stderr, flush=True)
+        return
+    raise LoadError(f"store schema is {found!r}, expected {SCHEMA_VERSION} — apply tools/schema/books.sql to a fresh store")
 
 
 def norm_label(s) -> str:
@@ -1903,9 +2011,12 @@ def declared_rectangle(spec: dict, layout: dict, artifact: dict) -> _Rect:
     Layout semantics are AUTHORITATIVE from the allow-list (header_row,
     group_row, sub_header_row, first_data_row, skip_rows, last_data_row,
     key_column, external_links, derived_columns); the curation spec supplies the
-    expected column labels and their account/metric mapping. E5(b)'s per-column
-    allow-list fields do not exist in layouts.json yet, so the spec's `col` is
-    the expected label today; when the allow-list gains `expected_label` it wins.
+    expected column labels and their account/metric mapping, so the RESOLUTION key
+    stays the label. §E5b's per-column `columns` map then ASSERTS the geometry that
+    this resolution discovered (letter -> expected_label + role) — see
+    `assert_column_declarations`, called by `load_structural_spec` right after this.
+    Resolution follows a label; a label that has moved is a frame change to be
+    ratified, not a frame to be followed.
     """
     idx = {c["a1"]: c for c in artifact.get("cells", [])}
     header_row = layout.get("header_row") or spec.get("header_row")
@@ -1991,8 +2102,287 @@ def assert_artifact_coverage(artifact: dict, rect: _Rect, where: str) -> None:
             )
 
 
-def assert_shape(artifact: dict, rect: _Rect, layout: dict, spec: dict) -> None:
-    """v0.2.1 §E4 load-time shape assertions. Mismatch -> Quarantine."""
+# ---------------------------------------------------------------- §E5b per-column shape
+# §E4's first load-time assertion was "the expected label at each declared header cell
+# matches the allow-list". For the first wave it COULD NOT FAIL: the allow-list
+# declared no per-column expectation, and `assert_shape` only ever re-checked that a
+# cell the reader had ALREADY matched by label was not blank — a tautology. A renamed
+# header, a column inserted into a mapped tab, or a duplicate label reaching for a
+# mapped metric would have loaded the wrong figures into the wrong metrics silently
+# (the pre-change proof: .scratch/e5b/shift_probe.py loads a shifted real frame with
+# status='complete'). §E5b supplies the declarations; this is the gate that reads them.
+#
+# The join key is the LETTER; the label is what gets ASSERTED, never what gets joined
+# on — a label that has MOVED is exactly the defect only a position pin can see. The
+# role vocabulary is the one `src_column.role` already CHECKs in books.sql.
+#
+# `metric_id` is deliberately NOT a field here (v0.3 §D-4): metric/account binding
+# lives in the curation spec and reaches src_column from there. Layout = what the
+# sheet IS; spec = what the store DOES with a letter. The join key is the letter.
+COLUMN_ROLES = ("value", "key", "derived", "external", "copy", "scratch")
+_COLUMN_LETTER_RE = re.compile(r"^[A-Za-z]{1,3}$")
+# role -> (the observed counter that must PREDOMINATE, the counter it must beat, how
+# the evidence is named in a refusal). `key` and `scratch` are checked structurally
+# (addressing / no binding), not by cell character.
+ROLE_EVIDENCE = {
+    "value": ("entered_measurable", "derivation_bearing", "entered measurable literals"),
+    "derived": ("derivation_bearing", "entered_measurable", "formula-bearing cells"),
+    "external": ("external", "entered_measurable", "cross-sheet or IMPORT* cells"),
+    "copy": ("copy", "entered_measurable", "pure-reference formulas"),
+}
+
+
+def column_declarations(layout: dict, spec: dict) -> dict:
+    """Parse + validate the tab entry's `columns` map -> {col_index: declaration}.
+
+    A malformed declaration raises LoadError, never Quarantine: a broken allow-list is
+    a CURATION bug, and quarantining the spec for it would hide that bug behind a
+    coverage_calendar row for a frame that was never describable."""
+    raw = layout.get("columns")
+    alias = spec["alias"]
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise LoadError(f"{alias}: `columns` must be an object keyed by column letter "
+                        f"(A, B, ...), got {type(raw).__name__}")
+    decls: dict = {}
+    for letter, ent in raw.items():
+        if not isinstance(letter, str) or not _COLUMN_LETTER_RE.match(letter.strip()):
+            raise LoadError(f"{alias}: columns key {letter!r} is not a column letter")
+        let = letter.strip().upper()
+        ci = col_index(let)
+        if ci in decls:
+            raise LoadError(f"{alias}: two columns keys fold to letter {let} "
+                            f"(check for {letter!r} differing only in case)")
+        if not isinstance(ent, dict):
+            raise LoadError(f"{alias}: columns[{let}] must be an object carrying "
+                            f"expected_label + role, got {type(ent).__name__}")
+        if "metric_id" in ent:
+            raise LoadError(f"{alias}: columns[{let}] declares metric_id — that binding lives "
+                            f"in the curation spec (v0.3 §D-4), never in the allow-list")
+        role = ent.get("role")
+        if role not in COLUMN_ROLES:
+            raise LoadError(f"{alias}: columns[{let}].role {role!r} is not one of "
+                            f"{list(COLUMN_ROLES)} (the src_column.role vocabulary)")
+        if "expected_label" not in ent:
+            raise LoadError(f"{alias}: columns[{let}] has no expected_label — name the header "
+                            f"text the column must carry, or null if it must carry none")
+        label = ent["expected_label"]
+        if label is not None and not isinstance(label, str):
+            raise LoadError(f"{alias}: columns[{let}].expected_label {label!r} is neither a "
+                            f"string nor null")
+        decls[ci] = {"letters": let, "col_index": ci, "expected_label": label, "role": role,
+                     "note": ent.get("note")}
+    return decls
+
+
+def cell_character(cell: dict) -> str:
+    """One cell's OBSERVED character — a kind, never a value: blank | literal |
+    error | spill | external | copy | derived.
+
+    external outranks copy outranks derived, matching §4's precedence: a cross-sheet
+    reference is import-sourced however it is shaped."""
+    kind = cell.get("kind")
+    if kind is None or kind == "blank":
+        return "blank"
+    if kind == "error":
+        return "error"
+    if kind == "spill":
+        return "spill"
+    if kind == "literal":
+        return "literal"
+    formula = cell.get("formula") or ""
+    body = formula[1:] if formula.startswith("=") else formula
+    funcs = {m.group(1).upper() for m in _FUNC_RE.finditer(_STR_RE.sub('""', body))}
+    if any(sheet is not None for sheet, _c, _r in _formula_refs(body)) or (funcs & EXTERNAL_FUNCS):
+        return "external"
+    if _PURE_REF_RE.match(body.strip()):
+        return "copy"
+    return "derived"
+
+
+def column_character(idx: dict, ci: int, rows: list) -> dict:
+    """Observed character of one column across the declared rectangle's LIVE rows.
+
+    Counts of kinds only — letters and counts, never a value (§E5b's whole purpose is
+    to say something checkable about a column without reading a single figure)."""
+    let = col_letters(ci)
+    ch = {"literal": 0, "derived": 0, "external": 0, "copy": 0, "error": 0, "spill": 0,
+          "blank": 0, "populated": 0, "derivation_bearing": 0, "entered_measurable": 0}
+    for r in rows:
+        kind = cell_character(idx.get(f"{let}{r}") or {"kind": "blank"})
+        ch[kind] += 1
+        if kind == "blank":
+            continue
+        ch["populated"] += 1
+        if kind == "literal":
+            num, _why = coerce_num((idx.get(f"{let}{r}") or {}).get("value"))
+            if num is not None:
+                ch["entered_measurable"] += 1
+        else:
+            ch["derivation_bearing"] += 1
+    return ch
+
+
+def assert_column_declarations(artifact: dict, rect: "_Rect", layout: dict,
+                               spec: dict) -> dict:
+    """v0.3 §E4 assertions made REAL by §E5b declarations. Mismatch -> Quarantine.
+
+    Three checks, each able to fail:
+      (1) DECLARED — every column the curation spec maps (including the row-addressing
+          one) must carry a declaration. An undeclared mapped column is the vacuity
+          this leg exists to end, so it refuses the load. A skipped column MAY be
+          declared (pinning the whole band is the better curation) and its absence is
+          tolerated: it binds no metric, so it can load no wrong figure.
+      (2) LABEL — the artifact's header cell at `{letter}{header_row}` carries the
+          declared `expected_label`; when the declaration is `null`, that letter must
+          carry NO label (the unlabelled key column, and the blank spacer columns).
+      (3) CHARACTER — the observed character is consistent with the declared role:
+          `value` carries an entered literal, `derived`/`external`/`copy` carry a cell
+          of that kind, `key` IS the row-addressing column and only it is, `scratch`
+          binds no account/metric. A `derived` column whose derivation is STATED in the
+          curation spec (`mode: derive_from_delta`) needs no sheet formula — the
+          derivation is declared, not inferred, and the converse holds too: a
+          derive_from_delta mapping MUST be declared `derived`.
+          A column with no observation in the rectangle contradicts nothing: an empty
+          column is DM-2026-01's business, never a shape finding.
+    """
+    alias = spec["alias"]
+    decls = column_declarations(layout, spec)
+    idx = {c["a1"]: c for c in artifact.get("cells", [])}
+    rows = [r for r, _v in _live_rows(artifact, rect, spec)]
+    key_letters = col_letters(rect.key_col)
+    # (1) THE BIJECTION. Every label the artifact carries inside the frame must be
+    # declared, and every column the curation spec maps must be declared AT THE LETTER
+    # WHERE IT SITS. A gap in either direction is the vacuity: an undeclared column is
+    # an unchecked column, and an unchecked column is not a check.
+    bounds = (artifact.get("returned_bounds") or {})
+    max_cols = int(bounds.get("cols") or 0) or (max(rect.cols) + 1 if rect.cols else 0)
+    labelled = {}
+    for ci in range(max_cols):
+        rec = idx.get(f"{col_letters(ci)}{rect.header_row}")
+        if rec is not None and cell_character(rec) != "blank" and rec.get("value") is not None:
+            labelled[ci] = norm_label(rec.get("value"))
+    missing = sorted(
+        f"{col_letters(ci)} ({labelled[ci]!r})" for ci in labelled if ci not in decls)
+    unmapped = sorted(f"{col_letters(ci)} ({label})"
+                      for label, (ci, _h, mapping) in rect.resolved.items()
+                      if mapping is not None and ci not in decls)
+    if missing or unmapped:
+        raise Quarantine(
+            "column-undeclared",
+            f"{alias}: columns the artifact carries but the allow-list does not declare: "
+            f"{missing}; mapped columns with no declaration: {unmapped} — declare "
+            f"expected_label + role on the tab entry (v0.3 §E4/§E5b)")
+    label_problems: list[str] = []
+    role_problems: list[str] = []
+    report: list[dict] = []
+    for ci in sorted(decls):
+        d = decls[ci]
+        let = d["letters"]
+        hits = [(label, mapping) for label, (ci2, _h, mapping) in rect.resolved.items()
+                if ci2 == ci]
+        label, mapping = hits[0] if hits else (None, None)
+
+        # (2) the label at the DECLARED position
+        at = f"{let}{rect.header_row}"
+        rec = idx.get(at) or {"kind": "blank"}
+        kind = cell_character(rec)
+        carried = rec.get("value")
+        if d["expected_label"] is None:
+            if kind != "blank":
+                label_problems.append(f"{at}: declares NO label, the artifact carries "
+                                      f"{carried!r}")
+        elif kind == "blank":
+            label_problems.append(f"{at}: declares {d['expected_label']!r}, the artifact "
+                                  f"carries no label there")
+        elif _label_key(carried) != _label_key(d["expected_label"]):
+            label_problems.append(f"{at}: declares {d['expected_label']!r}, the artifact "
+                                  f"carries {carried!r}")
+
+        # (3) observed character vs declared role
+        ch = column_character(idx, ci, rows)
+        role = d["role"]
+        bound = bool(mapping and (mapping.get("metric") or mapping.get("account")))
+        addressing = bool(mapping and mapping.get("role") in ("as_of", "work_year"))
+        mode = (mapping or {}).get("mode")
+        if role == "key" and ci != rect.key_col:
+            role_problems.append(f"{let}: declares role 'key' but the row-addressing column "
+                                 f"is {key_letters}")
+        if role != "key" and ci == rect.key_col:
+            role_problems.append(f"{let}: the row-addressing column is declared {role!r}; "
+                                 f"only the key column may be anything but 'key'")
+        if role == "key" and label is not None and not addressing:
+            role_problems.append(f"{let}: declares role 'key' but the spec binds it to "
+                                 f"{(mapping or {}).get('role')!r}, not to row addressing")
+        if role == "scratch" and bound:
+            role_problems.append(f"{let}: declared 'scratch' (never a fact source) but the "
+                                 f"spec binds it to an account/metric")
+        if mode == "derive_from_delta" and role != "derived":
+            role_problems.append(f"{let}: the spec derives this column by difference "
+                                 f"(mode=derive_from_delta) but the layout declares {role!r}")
+        stated_derivation = role == "derived" and mode == "derive_from_delta"
+        stated_external = role == "external" and let in (rect.external_cols or set())
+        if ch["populated"] and not (stated_derivation or stated_external):
+            need = ROLE_EVIDENCE.get(role)
+            if need and not (ch[need[0]] >= 1 and ch[need[0]] > ch[need[1]]):
+                role_problems.append(
+                    f"{let}: declared {role!r} but {need[2]} do not predominate it "
+                    f"(observed: literal={ch['literal']} entered_measurable="
+                    f"{ch['entered_measurable']} derived={ch['derived']} external="
+                    f"{ch['external']} copy={ch['copy']} error={ch['error']} "
+                    f"spill={ch['spill']})")
+        report.append({"letters": let, "col_index": ci, "declared_label": d["expected_label"],
+                       "role": role, "spec_label": label, "bound": bound,
+                       "addressing": addressing, "stated_derivation": stated_derivation,
+                       "stated_external": stated_external, "unobserved": ch["populated"] == 0,
+                       "observed": {k: ch[k] for k in
+                                    ("literal", "entered_measurable", "derived", "external",
+                                     "copy", "error", "spill", "blank", "populated",
+                                     "derivation_bearing")}})
+    if label_problems or role_problems:
+        rule = "column-label-mismatch" if label_problems else "column-role-mismatch"
+        problems = label_problems + role_problems
+        raise Quarantine(rule, "; ".join(problems[:6])
+                         + (f" (+{len(problems) - 6} more)" if len(problems) > 6 else ""))
+    return {"declared": report, "header_row": rect.header_row, "live_rows": len(rows),
+            "key_column": key_letters}
+
+
+def _print_column_shape(alias: str, shape: dict) -> None:
+    """Loud, per-column PROOF that the §E5b assertions ran (letters, roles and kind
+    counts only — never a value). A check nobody can see run is a check nobody can
+    trust: the same visibility rule that made the zero report mandatory (DM-2026-01).
+    """
+    cols = (shape or {}).get("declared") or []
+    if not cols:
+        return
+    tally: dict = {}
+    for c in cols:
+        tally[c["role"]] = tally.get(c["role"], 0) + 1
+    print(f"  column shape {alias} (E5b): {len(cols)} declared columns asserted at "
+          f"header_row {shape['header_row']} — "
+          + " ".join(f"{r}={n}" for r, n in sorted(tally.items())), flush=True)
+    for c in cols:
+        flags = []
+        if c["stated_derivation"]:
+            flags.append("derivation STATED (derive_from_delta)")
+        if c["stated_external"]:
+            flags.append("external STATED (external_links)")
+        if c["unobserved"]:
+            flags.append("no observations in the rectangle")
+        o = c["observed"]
+        print(f"    {c['letters']:<3} {c['role']:<8} entered={o['entered_measurable']:<4}"
+              f" derived={o['derived']:<4} external={o['external']:<4} copy={o['copy']:<3}"
+              f" blank={o['blank']:<4}" + ("  [" + ", ".join(flags) + "]" if flags else ""),
+              flush=True)
+
+
+def assert_shape(artifact: dict, rect: _Rect, layout: dict, spec: dict) -> dict:
+    """v0.2.1 §E4 load-time shape assertions — now including the §E5b per-column
+    gate that makes its first bullet REAL. Mismatch -> Quarantine. Returns the E5b
+    column report so the load can carry it into its result."""
+    column_shape = assert_column_declarations(artifact, rect, layout, spec)
     idx = {c["a1"]: c for c in artifact.get("cells", [])}
     problems: list[str] = []
 
@@ -2042,6 +2432,7 @@ def assert_shape(artifact: dict, rect: _Rect, layout: dict, spec: dict) -> None:
     if problems:
         raise Quarantine("shape-mismatch", "; ".join(problems[:6])
                          + (f" (+{len(problems) - 6} more)" if len(problems) > 6 else ""))
+    return column_shape
 
 
 def rect_key_live(value, spec: dict) -> bool:
@@ -2322,33 +2713,38 @@ def _quarantine(conn, batch: Batch, spec: dict, artifact: dict | None, q: Quaran
     print(f"  !! QUARANTINED {spec['alias']}: {q.rule} — {q.detail}", flush=True)
 
 
-def _write_src_columns(conn, source_id: int, spec: dict, rect: _Rect, col_facts: dict,
-                       metric_ids: dict, acct_ids: dict) -> int:
+def _write_src_columns(conn, source_id: int, spec: dict, layout: dict, rect: _Rect,
+                       col_facts: dict, metric_ids: dict, acct_ids: dict) -> int:
     """Populate src_column (never written before v0.2.5): column-grain derivation,
-    per blueprint §2/§5. Replaces the tab's rows so a re-load is idempotent."""
+    per blueprint §2/§5. Replaces the tab's rows so a re-load is idempotent.
+
+    v0.2.6 (COS ruling 2026-09-12): `role` is DECLARATIVE — the allow-list `columns`
+    entry owns it. `origin`/`derivation_kind` stay the OBSERVED per-cell facts. The
+    two used to be conflated: `role` was computed from origin precedence, so a column
+    declared `value` whose cells merely happen to be formula-heavy (stats D/E: entered
+    still predominates, but any derived cell won) recorded `derived`, and the
+    declaration and the store could silently disagree. The declaration is mandatory
+    for every resolved column (`assert_column_declarations` refuses otherwise), so a
+    resolved column with no declaration is a loader bug, never a licence to fall back
+    to the old inference."""
     row = conn.execute("SELECT tab_id FROM src_tab WHERE source_id=? AND tab=? AND block=''",
                        (source_id, spec["tab"])).fetchone()
     if row is None:
         raise LoadError(f"{spec['alias']}: src_tab row missing for tab {spec['tab']!r}")
     tab_id = row[0]
+    decls = column_declarations(layout, spec)
     conn.execute("DELETE FROM src_column WHERE tab_id=?", (tab_id,))
     n = 0
     by_label = {label: tup for label, tup in rect.resolved.items()}
     for label, (ci, header_rec, mapping) in sorted(by_label.items(), key=lambda kv: kv[1][0]):
         facts = col_facts.get(ci, {})
-        origin = facts.get("origin")
-        if mapping and mapping.get("role") in ("as_of", "work_year"):
-            role = "key"
-        elif origin == "external" or col_letters(ci) in rect.external_cols:
-            role = "external"
-        elif origin == "copy":
-            role = "copy"
-        elif origin == "derived":
-            role = "derived"
-        elif mapping is None:
-            role = "scratch"
-        else:
-            role = "value"
+        d = decls.get(ci)
+        if d is None:
+            raise LoadError(
+                f"{spec['alias']}: column {col_letters(ci)} ({label!r}) has no `columns` "
+                f"declaration — src_column.role is declarative (v0.2.6) and "
+                f"assert_column_declarations should have refused this frame")
+        role = d["role"]
         account_id = acct_ids.get(mapping.get("account")) if mapping else None
         metric_id = metric_ids.get(mapping.get("metric")) if mapping else None
         unit = None
@@ -2586,7 +2982,8 @@ def _load_state_structural(conn, batch: Batch, spec: dict, source_id: int, layou
             f"is an expected anchor period (declared month {f['anchor_month']}) but "
             f"blank — no row written; a missing observation, never N/A (DM-2026-01)")
     _resolve_col_origin(col_facts)
-    n_cols = _write_src_columns(conn, source_id, spec, rect, col_facts, metric_ids, acct_ids)
+    n_cols = _write_src_columns(conn, source_id, spec, layout, rect, col_facts,
+                                metric_ids, acct_ids)
     if n_skipped:
         issues.append(f"{n_skipped} rows identical to existing current rows — skipped")
     if issues:
@@ -2716,7 +3113,7 @@ def _load_ssa_earnings_structural(conn, batch: Batch, spec: dict, source_id: int
         years.add(work_year)
         n += 1
     _resolve_col_origin(col_facts)
-    _write_src_columns(conn, source_id, spec, rect, col_facts, metric_ids, acct_ids)
+    _write_src_columns(conn, source_id, spec, layout, rect, col_facts, metric_ids, acct_ids)
     coverage(conn, spec["alias"], spec["tab"],
              {str(y): ("loaded" if y in years else "absent-in-source") for y in range(1996, 2026)},
              note="structural read; non-numeric work-year rows refused loudly")
@@ -2749,7 +3146,8 @@ def load_structural_spec(conn, batch: Batch, spec: dict, allow: dict, acct_ids, 
             allow, alias_base, artifact.get("tab") or spec.get("tab"), spec["alias"])
         rect = declared_rectangle(spec, layout, artifact)
         assert_artifact_coverage(artifact, rect, spec["alias"])
-        assert_shape(artifact, rect, layout, spec)
+        column_shape = assert_shape(artifact, rect, layout, spec)
+        _print_column_shape(spec["alias"], column_shape)
         if spec["family"] == "state":
             n, n_cols, extras = _load_state_structural(conn, batch, spec, source_id, layout,
                                                        artifact, rect, acct_ids, metric_ids)
@@ -2762,6 +3160,7 @@ def load_structural_spec(conn, batch: Batch, spec: dict, allow: dict, acct_ids, 
                             f"family {spec['family']!r} (P2 first wave is stats + ss_earning)")
         _print_blank_report(spec["alias"], extras)
         return {"rows": n, "quarantined": False, "src_columns": n_cols,
+                "column_shape": column_shape,
                 "blank_report": extras.get("zero_report"),
                 "anchored_blanks": extras.get("anchored_blanks", []),
                 "series_shapes": extras.get("series_shapes", []),

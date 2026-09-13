@@ -73,9 +73,16 @@ def cell(a1, kind="literal", value=None, **kw):
     return rec
 
 
+# E5b per-column declarations (v0.3 §E5b): letter -> what the column IS. The synth
+# fixtures write literals into B and C, so both are `value`; A addresses rows.
+COLUMNS = {"A": {"expected_label": "Date", "role": "key"},
+           "B": {"expected_label": "Alpha", "role": "value"},
+           "C": {"expected_label": "Beta", "role": "value"}}
+
+
 def allow(blank_means, series_start=None, series_anchor_month=None):
     tabs = {"Synth Tab": {"header_row": 1, "first_data_row": 2, "key_column": "A",
-                          "role": "raw", "grain": "month-end"}}
+                          "role": "raw", "grain": "month-end", "columns": dict(COLUMNS)}}
     if blank_means is not None:
         tabs["Synth Tab"]["blank_means"] = blank_means
     if series_start is not None:

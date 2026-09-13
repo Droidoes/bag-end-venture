@@ -50,8 +50,17 @@ def cell(a1, kind="literal", value=None, **kw):
     return rec
 
 
+# E5b: the tab entry declares what each COLUMN IS — letter is the join key, the label
+# is the assertion, the role is the src_column.role vocabulary. No metric_id here:
+# metric binding lives in SPEC below (v0.3 §D-4).
 ALLOW = {"sources": {"synthsrc": {"tabs": {
-    "Synth Tab": {"header_row": 1, "first_data_row": 2, "key_column": "A", "role": "raw"},
+    "Synth Tab": {"header_row": 1, "first_data_row": 2, "key_column": "A", "role": "raw",
+                  "columns": {
+                      "A": {"expected_label": "Date", "role": "key"},
+                      "B": {"expected_label": "Alpha", "role": "value"},
+                      "C": {"expected_label": "Beta", "role": "derived"},
+                      "D": {"expected_label": "Total", "role": "derived"},
+                  }},
 }}}}
 
 SPEC = {
@@ -236,8 +245,7 @@ def main() -> int:
     L.assert_shape(art, rect, ALLOW["sources"]["synthsrc"]["tabs"]["Synth Tab"], SPEC)
     check("declared header labels + live first_data_row pass shape", True)
 
-    bad_hdr = base_cells()
-    bad_hdr[1] = cell("B1", value="Renamed")
+    bad_hdr = [cell("B1", value="Renamed") if c["a1"] == "B1" else c for c in base_cells()]
     try:
         L.assert_shape(artifact(bad_hdr), L.declared_rectangle(
             SPEC, ALLOW["sources"]["synthsrc"]["tabs"]["Synth Tab"], artifact(bad_hdr)),
@@ -249,7 +257,8 @@ def main() -> int:
 
     # skip_rows must not sit on a live key row
     skip_layout = {"header_row": 1, "group_row": 1, "first_data_row": 2, "skip_rows": [1],
-                   "key_column": "A"}
+                   "key_column": "A", "columns": ALLOW["sources"]["synthsrc"]["tabs"]
+                   ["Synth Tab"]["columns"]}
     spec_skip = {**SPEC, "header_row": 1}
     try:
         L.assert_shape(artifact(base_cells()), L.declared_rectangle(
@@ -304,8 +313,7 @@ def main() -> int:
     con2 = fresh()
     a2, m2 = L.ensure_dims(con2, DIMS, METRICS)
     with tempfile.TemporaryDirectory() as td:
-        bad = base_cells()
-        bad[1] = cell("B1", value="Renamed")
+        bad = [cell("B1", value="Renamed") if c["a1"] == "B1" else c for c in base_cells()]
         ap = Path(td) / "art.json"
         ap.write_text(json.dumps(artifact(bad)))
         spec = {**SPEC, "artifact": str(ap)}

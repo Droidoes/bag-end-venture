@@ -25,6 +25,13 @@ Commands:
                                                (never private/books.db); --structural
                                                uses the P2 snapshot-artifact reader.
   query "<sql>"                                Run SQL against private/books.db
+  export finpage [--db PATH] [--out DIR]       Regenerate the financial-page bundle
+                                              (default store private/books.db, default
+                                              dir private/export). Both this and `query`
+                                              are READ paths: a pre-migration store is
+                                              accepted with a WARNING (loader21
+                                              READ_COMPATIBLE_SCHEMA_VERSIONS); only the
+                                              loader requires an exact version match.
 
 Conventions: see tools/README.md. Data stays in private/ (gitignored).
 """
@@ -306,16 +313,25 @@ def cmd_load(args: argparse.Namespace) -> None:
                  "reported above, never N/A (DM-2026-01)")
 
 
-def _connect_ro():
-    """Open the store strictly read-only.
+def _connect_ro(db_path=None):
+    """Open a store strictly read-only (default: the live `config.DB_PATH`).
 
     The query path must never be able to mutate books.db: with `mode=ro` any DDL
     or DML fails at prepare time, so a stray `DROP` cannot destroy data (plain
     connect() persisted DDL while rolling DML back only on close — the 2026-09-11
     finding behind Task #19a).
+
+    `db_path` exists so a read-only consumer can be aimed at another store (the
+    shadow, a fixture) without ever implying it may be written: this handle is
+    ro whatever it is pointed at.
     """
     import sqlite3
-    conn = sqlite3.connect(f"file:{config.DB_PATH}?mode=ro", uri=True)
+    # as_uri() percent-encodes, because --db accepts an arbitrary path and SQLite's
+    # URI parser reads `#` as a fragment and `?` as the query: `file:…/store#1.db`
+    # silently opens a DIFFERENT (empty) database instead of the named one — the
+    # worst failure mode available, a clean-looking read of the wrong store.
+    conn = sqlite3.connect(f"{Path(db_path or config.DB_PATH).resolve().as_uri()}?mode=ro",
+                           uri=True)
     # Connection-scoped and write-free, so it is legal on a read-only handle;
     # loader.assert_schema requires it to be ON.
     conn.execute("PRAGMA foreign_keys=ON")
@@ -325,6 +341,9 @@ def _connect_ro():
 def cmd_query(args: argparse.Namespace) -> None:
     import sqlite3
     conn = _connect_ro()
+    # Read side: a pre-migration store may be QUERIED (loader21 warns), but only an
+    # exact-version store may be LOADED. See READ_COMPATIBLE_SCHEMA_VERSIONS.
+    loader21.assert_schema(conn, mode="read")
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(args.sql).fetchall()
@@ -348,8 +367,12 @@ def cmd_query(args: argparse.Namespace) -> None:
 def cmd_export(args: argparse.Namespace) -> None:
     if args.export_cmd == "finpage":
         from bagend import finpage
-        con = _connect_ro()
-        loader21.assert_schema(con)
+        con = _connect_ro(args.db)
+        # This is a CONSUMER, not a loader: read mode, so the owner's dashboard
+        # keeps regenerating while the live store waits for a migration it cannot
+        # yet be given. loader21 warns on a pre-migration store; writes still
+        # require an exact version match.
+        loader21.assert_schema(con, mode="read")
         payload = finpage.build_payload(con)
         con.close()
         out = Path(args.out)
@@ -358,7 +381,8 @@ def cmd_export(args: argparse.Namespace) -> None:
         target.write_text(json.dumps(payload, indent=1, default=str))
         n_tax = len(payload["pages"]["retirement"]["tax"])
         n_series = len(payload["pages"]["retirement"]["networth"]["as_ofs"])
-        print(f"finpage payload -> {target} ({n_series} net-worth points, {n_tax} tax years)")
+        print(f"finpage payload -> {target} (from {args.db} @ schema "
+              f"{payload['meta']['schema']}: {n_series} net-worth points, {n_tax} tax years)")
 
 
 def main() -> None:
@@ -459,6 +483,10 @@ def main() -> None:
     ex_fin = ex_sub.add_parser("finpage")
     ex_fin.add_argument("--out", default="private/export",
                         help="destination dir (default private/export; Homepage-DB/BagEnd is the deploy target)")
+    ex_fin.add_argument("--db", default=str(config.DB_PATH),
+                        help="store to READ (default private/books.db); the handle is "
+                             "always mode=ro, so pointing it at the shadow cannot "
+                             "disturb either store")
 
     args = parser.parse_args()
     {"catalog": cmd_catalog, "fetch": cmd_fetch, "sheets": cmd_sheets,

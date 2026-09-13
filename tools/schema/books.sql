@@ -1,4 +1,4 @@
--- books.db schema — v0.2.5 (2026-09-12) · author: Roth (single-threaded, per ratified fix order)
+-- books.db schema — v0.2.6 (2026-09-12) · author: Roth (single-threaded, per ratified fix order)
 -- Requirement set: .scratch/schema-review/{CONVERGENCE,leg1-semantics,leg2-adversarial,leg3-purpose}.md
 -- Blueprint: docs/superpowers/plans/2026-09-07-schema-v0.2.md
 -- P0 blueprint: docs/superpowers/plans/2026-09-12-structural-prefetch-v0.3.md §2/§4/§5/§8
@@ -33,6 +33,18 @@
 -- recreated) before it agrees with this script. Tables and CHECKs are UNTOUCHED —
 -- this is a view-only change. See .scratch/sliceb/report.md.
 --
+-- v0.2.6 (2026-09-12, closeout): Slice B's view rewrite is now STAMPED. The version
+-- bump is owed to the VIEW DDL ONLY — tables and CHECKs are untouched (v0.2.5 was,
+-- and remains, the table-shape version). A store built from the pre-Slice-B v0.2.5
+-- script carries DIFFERENT view DDL while reporting the SAME version, which is
+-- exactly the half-migrated state the stamp exists to expose: SQLite creates views
+-- LAZILY, so such a store CREATEs fine and fails at READ with `no such column:
+-- f.origin` (v_state_current's new select list), never at create. A store is
+-- brought forward by recreating its six views (or by a fresh rebuild) — no data
+-- reload, because no table changed. src_column.role is also declaration-owned as of
+-- this version (the loader writes it from the allow-list `columns` entry; see
+-- loader21._write_src_columns) — a loader semantic, still no DDL.
+--
 -- APPLICATION RULES
 --   * Apply to a FRESH store only. No IF NOT EXISTS anywhere: re-application fails
 --     loudly by design. Migration path is rebuild-from-Drive, never ALTER-in-place
@@ -45,8 +57,13 @@
 --     indexes), never by ALTER-in-place. The P0 parity harness must therefore
 --     compare a REBUILT table against a FRESHLY CREATED one (sqlite_master DDL +
 --     row data) — not against an ALTER diff.
---   * Every connection MUST set PRAGMA foreign_keys=ON (per-connection in SQLite);
---     the loader asserts it plus _schema_meta.schema_version='v0.2.5' on connect.
+--   * Every connection MUST set PRAGMA foreign_keys=ON (per-connection in SQLite).
+--   * The schema gate is split by INTENT, not weakened: a WRITE (load/ingest)
+--     requires _schema_meta.schema_version to equal the toolkit's SCHEMA_VERSION
+--     exactly; a READ (query/export) also accepts the pre-migration whitelist in
+--     loader21.READ_COMPATIBLE_SCHEMA_VERSIONS and warns loudly on stderr. The
+--     read entries are TEMPORARY — drop them at the P3 cutover so reads become
+--     exact too, or "compatible" quietly degrades into "any old store may be read".
 --
 -- IDENTITY MODEL (blueprint D1/D2)
 --   * natural_key: SOURCE-SCOPED business identity constructed at ingest
@@ -94,7 +111,7 @@ CREATE TABLE _schema_meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
-INSERT INTO _schema_meta(key, value) VALUES ('schema_version', 'v0.2.5');
+INSERT INTO _schema_meta(key, value) VALUES ('schema_version', 'v0.2.6');
 
 CREATE TABLE load_batch (
   batch_id     INTEGER PRIMARY KEY,

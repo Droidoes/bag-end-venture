@@ -2,8 +2,8 @@
 """P0 schema-parity harness — blueprint v0.3 §8 row P0. Offline, stdlib only.
 
 What it proves, per case:
-  1. tools/schema/books.sql applies to a FRESH temp DB and stamps v0.2.5; the
-     loader's version assertion accepts it.
+  1. tools/schema/books.sql applies to a FRESH temp DB and stamps
+     loader21.SCHEMA_VERSION; the loader's version assertion accepts it.
   2. Every new column and CHECK exists in sqlite_master (DDL text inspection +
      PRAGMA table_info), and the four composite pair-CHECK bodies are literally
      identical to each other.
@@ -20,10 +20,10 @@ What it proves, per case:
   7. New defaults hold (presence='measured', needs_verify=0) and src_column.role
      accepts 'value' / rejects 'bogus'.
   8. §8 P0 gate proper: a v0.2.4 store migrated by REBUILD of every affected
-     table is compared against a FRESHLY CREATED v0.2.5 store — full catalog DDL
-     parity (tables, indexes, views, triggers), row-data parity, and live
-     widened-CHECK behaviour post-rebuild. A CHECK change has no ALTER, so an
-     ALTER diff is not a valid comparison; rebuilt-vs-fresh is.
+     table is compared against a FRESHLY CREATED store at loader21.SCHEMA_VERSION
+     — full catalog DDL parity (tables, indexes, views, triggers), row-data parity,
+     and live widened-CHECK behaviour post-rebuild. A CHECK change has no ALTER, so
+     an ALTER diff is not a valid comparison; rebuilt-vs-fresh is.
 
 Never touches private/ — all databases are temp files under $TMPDIR or in-memory.
 """
@@ -146,8 +146,8 @@ def case_fresh_apply_and_version():
         db = str(Path(td) / "fresh.db")
         con = apply_ddl(NEW_DDL, db)
         v = con.execute("SELECT value FROM _schema_meta WHERE key='schema_version'").fetchone()[0]
-        assert v == "v0.2.5", f"schema_version is {v!r}, expected 'v0.2.5'"
-        assert loader21.SCHEMA_VERSION == "v0.2.5", "loader constant out of sync"
+        assert v == loader21.SCHEMA_VERSION, \
+            f"schema_version is {v!r}, expected {loader21.SCHEMA_VERSION!r}"
         loader21.assert_schema(con)  # the loader must accept the freshly applied store
         con.close()
 
@@ -300,7 +300,8 @@ def case_rebuild_vs_fresh():
             old.execute(idx)
     for v in DEPENDENT_VIEWS:
         old.execute(view_ddl(NEW_DDL, v))
-    old.execute("UPDATE _schema_meta SET value='v0.2.5' WHERE key='schema_version'")
+    old.execute("UPDATE _schema_meta SET value=? WHERE key='schema_version'",
+                (loader21.SCHEMA_VERSION,))
 
     loader21.assert_schema(old)  # the migrated store satisfies the loader's contract
 

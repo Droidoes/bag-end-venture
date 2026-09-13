@@ -30,6 +30,9 @@ brokerage account number was found inside a `tools/` file — see §Hygiene belo
           "external_links": { "K": "Buybacks" }, // optional: cells whose values come from another tab
           "grain": "one row per …",
           "dedupe": "disjoint | natural_key_prefer_latest",
+          "columns": {                        // per-column shape declarations (§E5b):
+            "A": { "expected_label": "Date",  //   letter -> what it IS, never a metric
+                   "role": "value" } },       //   value|key|derived|external|copy|scratch
           "warning": "…", "must": "…", "note": "…", "needs": "…"
         }
       }
@@ -49,6 +52,86 @@ every merge** and a grand-total row directly under the header — neither is
 expressible with `header_row` alone. The fields are optional and only meaningful
 where the tab really has that shape; unresolved entries keep
 `header_row: "unresolved"` until a human confirms.
+
+### Fields added 2026-09-12 — per-column shape declarations (`columns`, v0.3 §E5b)
+
+Every other per-column field on this list says what a column MEANS to the store. This
+one says what the column **IS** in the sheet — and it exists because §E4's load-time
+shape assertion ("the expected label at each declared header cell matches the
+allow-list") was **vacuous**: nothing declared any per-column expectation, so the
+assertion had nothing to fail against. A renamed header, a column inserted into a
+mapped tab, or a duplicate label reaching for a mapped metric would have loaded the
+wrong figures into the wrong metrics silently — proved on the real first-wave artifact
+before this field existed (a shifted frame loaded with `status='complete'`).
+
+```jsonc
+"tabs": {
+  "<tab>": {
+    "role": "raw",
+    "header_row": 1,
+    "columns": {
+      "<LETTER>": { "expected_label": "Date",     // required: the header text this
+                    "role": "key",                //   LETTER must carry at header_row
+                    "note": "why / the evidence"  // optional, as everywhere here
+      }
+    }
+  }
+}
+```
+
+**Rules (v0.3 §E4 + §E5b — implement, do not re-derive):**
+
+- **The join key is the LETTER.** The label is what gets ASSERTED, never what gets
+  joined on: a label that has MOVED is exactly the defect only a position pin can
+  see. Keying the map by label would have made `expected_label` a tautology.
+- **`expected_label`** is the header text the column must carry at
+  `{letter}{header_row}`, compared with the same whitespace-collapsed, case-folded
+  normalisation the rest of the join uses. `null` is a real assertion — it says this
+  letter must carry **NO** label (the unlabelled helper column, the spacer that must
+  stay a spacer); a label appearing there is a frame change and refuses the load.
+- **`role`** is the vocabulary `src_column.role` already CHECKs: `value`, `key`,
+  `derived`, `external`, `copy`, `scratch`. It describes the column, not the metric.
+- **NO `metric_id` here.** Metric/account binding lives in the curation spec and
+  reaches `src_column` from there (v0.3 §D-4; DM-2026-01 follow-up). A declaration
+  carrying `metric_id` is refused outright, so the split cannot rot back.
+  Layout = what the sheet IS; spec = what the store DOES with a letter.
+- **The bijection is both directions.** (i) Every column the curation spec MAPS must be
+  declared — an undeclared mapped column is an unchecked column, and an unchecked
+  column is not a check. (ii) Every label the artifact carries inside the returned
+  bounds must be declared, mapped or not: a skipped column pinned as `derived` costs
+  one line and means a column inserted ANYWHERE in the band breaks a pin. A letter
+  carrying no label and no observations needs no declaration — there is nothing to
+  ratify.
+- **Observed character must match the declared role** (counts and kinds over the
+  declared rectangle's live rows — never a value):
+  | role | assertion |
+  |---|---|
+  | `key` | this letter IS the row-addressing column (`rect.key_col`), and no other declared column may be it. Kind is NOT asserted: a ratified spine may be a generated series (`=EOMONTH`), which is precisely why "key" is a claim about addressing, not about cells. |
+  | `value` | entered measurable literals predominate (> formula-bearing cells). |
+  | `derived` | formula-bearing cells predominate — **or** the derivation is STATED in curation (`mode: derive_from_delta`, like the closed-account component); the exemption exists only because the derivation is declared, and the converse is enforced too: a `derive_from_delta` mapping must be declared `derived`. |
+  | `external` | cross-sheet / `IMPORT*` cells predominate — **or** the letter appears in `external_links` (a declared-external column may carry measured literals; §4 precedence). |
+  | `copy` | pure-reference formulas predominate. |
+  | `scratch` | never a fact source: the spec must bind no account/metric to it. No cell-kind claim (junk can be anything). |
+- **Absence is not a mismatch.** A column with no observation inside the rectangle
+  contradicts nothing: blanks are DM-2026-01's business (`blank_means`,
+  `series_start`, `coverage_calendar`), never a shape finding. Silently refusing an
+  empty column would make the loader's refusions unlearnable.
+- **Refusals.** A role outside the vocabulary, a non-letter key, two keys folding to
+  one letter, a missing/typed-non-string `expected_label`, an `int` map, `metric_id`
+  present → **`LoadError`**: a broken allow-list is a curation bug and must stop the
+  load, not quarantine a frame that was never describable. Label/character/bijection
+  findings against a well-formed declaration → **`Quarantine`** (`column-undeclared`,
+  `column-label-mismatch`, `column-role-mismatch`), which follows §7's existing
+  visible path: `coverage_calendar` `not-loaded` rows naming the rule, and
+  `load_batch.status='partial'`. Never a silent load under a shifted frame.
+- **Proof, not trust.** Each structural load prints a per-column `column shape` report
+  (letters, roles, kind COUNTS — never values) so a reader can see the assertions
+  RAN, the same visibility rule that made the zero report mandatory.
+- **Malformed-declaration refusals and shape quarantines are different channels on
+  purpose**: `LoadError` aborts, `Quarantine` stays visible in the store. Both are
+  covered by `tools/tests/column_shape_tests.py`, whose negative tests (rename,
+  insertion, duplicate label, role contradiction, undeclared column) are what keep
+  §E4 from going vacuous again.
 
 ### Fields added 2026-09-12 — per-column blank semantics (`blank_means`, DM-2026-01)
 
