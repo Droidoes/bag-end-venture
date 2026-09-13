@@ -14,8 +14,16 @@ Blank semantics (DM-2026-01): a blank cell inside an existing live row means 0
 blank_means='not_applicable' in the allow-list — then no row is written. The
 loader prints a per-column zero report at load, emits coverage_calendar
 expectations for the tabs it loads structurally, and fails loudly (report line
-+ non-zero exit at the CLI) when an EXPECTED anchor period of a not_applicable
-column is blank: a missing observation is never silently skipped as N/A.
++ non-zero exit at the CLI) when an EXPECTED anchor period of an ARMED
+not_applicable column is blank: a missing observation is never silently
+skipped as N/A. ARMING is column-grain and declaration-driven: a column is
+armed iff it declares blank_means='not_applicable' AND `series_anchor_month`
+(the calendar month in which the series is meaningful), and the period sits at
+or after the column's `series_start`; the EXPECTATIONS the armed guard is
+tested against stay tab-grain, read back from coverage_calendar.expected —
+that division is deliberate (DM-2026-01, COS decision: declare it, don't infer
+it — grain-inference arming could not fire for a column whose mapping carries
+no grain, and a guard that cannot fire for a column is not guarding it).
 
 Series start (DM-2026-01 owner confirmation): a column MAY also DECLARE
 `series_start` ('YYYY-MM') in the allow-list — the layout statement of where a
@@ -1703,6 +1711,64 @@ def series_starts_for(layout: dict, spec: dict, rect: "_Rect") -> dict[int, tupl
     return starts
 
 
+def series_anchor_month_value(raw) -> tuple[int, str | None]:
+    """Accept the plain form (12) or the object form ({'value': 12, 'note': evidence});
+    return (month, note). Refuse the rest — an anchor month that is not a calendar
+    month 1..12 arms nothing (a bool is an int in Python but not a month)."""
+    note = None
+    if isinstance(raw, dict):
+        note = raw.get("note")
+        raw = raw.get("value")
+    if isinstance(raw, bool) or not isinstance(raw, int) or not 1 <= raw <= 12:
+        raise LoadError(
+            f"series_anchor_month value {raw!r} is not a calendar month 1..12 — "
+            f"the month in which a not_applicable series is meaningful")
+    return raw, note
+
+
+def series_anchor_months_for(layout: dict, spec: dict, rect: "_Rect",
+                             blank_rules: dict[int, str]) -> dict[int, int]:
+    """Per-column anchor month from the allow-list tab entry's `series_anchor_month`
+    map (declared, never inferred — same pattern as blank_means/series_start).
+
+    This map ARMS the anchored-blank guard, and arming is COLUMN-grain: a column
+    is armed iff it declares blank_means='not_applicable' AND a
+    series_anchor_month. The EXPECTATIONS the armed guard is tested against stay
+    TAB-grain, read back from coverage_calendar.expected in
+    _anchored_blank_findings — that division is deliberate: a column's meaningful
+    month and the tab's period coverage answer different questions. This replaces
+    the earlier grain-inference arming, which could not fire for a column whose
+    mapping carries no grain (e.g. the Deposit column) — a guard that cannot fire
+    for a column is not guarding it.
+
+    Returns {col_index: month} — exactly the armed set. Fails loud on a malformed
+    value, a declaration naming no resolvable column, or a declaration on a
+    column that is not not_applicable (silently inert — refuse, never ignore)."""
+    declared = layout.get("series_anchor_month") or {}
+    by_label: dict[str, int] = {}
+    for label, raw in declared.items():
+        by_label[_label_key(label)] = series_anchor_month_value(raw)[0]
+    armed: dict[int, int] = {}
+    unmatched = dict(by_label)
+    for label, (ci, _hdr, _mapping) in rect.resolved.items():
+        hit = by_label.get(_label_key(label))
+        if hit is None:
+            continue
+        unmatched.pop(_label_key(label), None)
+        if blank_rules.get(ci, "zero") != "not_applicable":
+            raise LoadError(
+                f"{spec['alias']}: series_anchor_month on column {label!r} without "
+                f"blank_means='not_applicable' is silently inert — declare "
+                f"blank_means='not_applicable' first (DM-2026-01)")
+        armed[ci] = hit
+    if unmatched:
+        raise LoadError(
+            f"{spec['alias']}: series_anchor_month declares column(s) {sorted(unmatched)} "
+            f"that no column of this spec resolves — fix the allow-list entry "
+            f"(declarations are block-scoped to the tab entry)")
+    return armed
+
+
 def series_shape_lines(rect: "_Rect", pop_months: dict, blank_rules: dict,
                        series_starts: dict) -> list[dict]:
     """REPORT ONLY (DM-2026-01 follow-up, shape detector): for each mapped column
@@ -1741,26 +1807,6 @@ def series_shape_lines(rect: "_Rect", pop_months: dict, blank_rules: dict,
     return shapes
 
 
-def anchor_month_for(column_grain, tab_grain, where: str) -> int | None:
-    """The month whose cell is EXPECTED to carry an observation for a column
-    whose metric grain is coarser than the tab's row grain (DM-2026-01). Only
-    'annual' on a month-based spine is supported (anchor = December); a
-    same-grain or undeclared column has no anchor; anything else coarser
-    refuses rather than guesses an anchor."""
-    if not column_grain:
-        return None
-    cg = str(column_grain).strip().lower()
-    tg = str(tab_grain or "").strip().lower()
-    if not tg or cg == tg:
-        return None
-    if tg.startswith("month") and cg == "annual":
-        return 12
-    raise LoadError(
-        f"{where}: no anchored-blank rule for column grain {column_grain!r} on a "
-        f"{tab_grain!r} tab — declare the expectation in coverage_calendar "
-        f"instead of guessing")
-
-
 def _emit_period_coverage(conn, alias: str, tab: str, periods_live: set[str]) -> None:
     """Declare the tab's expected periods (DM-2026-01 boundary: absent rows and
     periods are coverage_calendar's business, never blank_means'). Every month
@@ -1786,10 +1832,12 @@ def _emit_period_coverage(conn, alias: str, tab: str, periods_live: set[str]) ->
 
 
 def _anchored_blank_findings(conn, spec: dict, anchored: dict) -> list[dict]:
-    """DM-2026-01 guard: a blank cell at an EXPECTED anchor period of a
-    not_applicable column is a missing observation, not N/A. Expectations are
-    read back from coverage_calendar.expected (their declared home), so a
-    period deliberately declared expected=0 stays silent — visibly."""
+    """DM-2026-01 guard: a blank cell at an EXPECTED anchor period of an ARMED
+    not_applicable column is a missing observation, not N/A. The division of
+    labour is deliberate: ARMING is column-grain (the column declares
+    blank_means='not_applicable' + series_anchor_month), while EXPECTATIONS are
+    tab-grain, read back from coverage_calendar.expected (their declared home),
+    so a period deliberately declared expected=0 stays silent — visibly."""
     if not anchored:
         return []
     expected = {r[0] for r in conn.execute(
@@ -1824,8 +1872,9 @@ def _print_blank_report(alias: str, extras: dict) -> None:
         print(f"  {sh['line']}", flush=True)
     for f in (extras or {}).get("anchored_blanks") or []:
         print(f"  !! ANCHORED BLANK {alias}: column {f['column']} ({f['letters']}) "
-              f"period {f['period']} is expected for a {f['grain']} metric but blank — "
-              f"no row written; a missing observation, never N/A (DM-2026-01)", flush=True)
+              f"period {f['period']} is an expected anchor period (declared month "
+              f"{f['anchor_month']}) but blank — no row written; a missing "
+              f"observation, never N/A (DM-2026-01)", flush=True)
 
 
 class _Rect:
@@ -2378,17 +2427,14 @@ def _load_state_structural(conn, batch: Batch, spec: dict, source_id: int, layou
     # column's series begins (series_start). Before that boundary the column
     # contributes nothing — no stated zero, and no expected anchor.
     series_starts = series_starts_for(layout, spec, rect)
-    tab_grain = layout.get("grain") or spec.get("grain")
-    anchors: dict[int, int] = {}      # col_index -> anchor month (only not_applicable columns)
-    for label, (ci, _hdr, mapping) in rect.resolved.items():
-        if mapping is None or mapping.get("role") in ("as_of", "work_year"):
-            continue
-        if blank_rules.get(ci, "zero") != "not_applicable":
-            continue
-        am = anchor_month_for(mapping.get("grain"), tab_grain,
-                              f"{spec['alias']} column {label!r}")
-        if am is not None:
-            anchors[ci] = am
+    # ARMING is column-grain and declaration-driven: a not_applicable column is
+    # armed iff it also declares series_anchor_month. The EXPECTATIONS the armed
+    # guard is tested against stay TAB-grain, read back from coverage_calendar
+    # .expected below — that division is deliberate: a column's meaningful month
+    # and the tab's period coverage answer different questions (DM-2026-01, COS
+    # decision: declare it, don't infer it — grain-inference arming could not
+    # fire for a column whose mapping carries no grain, which is no guard at all).
+    anchors = series_anchor_months_for(layout, spec, rect, blank_rules)
     blank_seen: dict[int, int] = {}   # col_index -> blank cells seen
     zero_written: dict[int, int] = {} # col_index -> zero_from_blank rows materialised
     na_skipped: dict[int, int] = {}   # col_index -> not_applicable blanks (no row)
@@ -2459,7 +2505,7 @@ def _load_state_structural(conn, batch: Batch, spec: dict, source_id: int, layou
                         anchored[(ci, as_of[:4])] = {
                             "column": label, "letters": col_letters(ci),
                             "row": rowno, "period": as_of[:7],
-                            "grain": mapping.get("grain"),
+                            "anchor_month": anchors[ci],
                         }
                     continue
             if derive_mode:
@@ -2537,8 +2583,8 @@ def _load_state_structural(conn, batch: Batch, spec: dict, source_id: int, layou
     for f in anchored_findings:
         issues.append(
             f"ANCHORED BLANK col {f['letters']} ({f['column']}): period {f['period']} "
-            f"is expected for a {f['grain']} metric but blank — no row written; "
-            f"a missing observation, never N/A (DM-2026-01)")
+            f"is an expected anchor period (declared month {f['anchor_month']}) but "
+            f"blank — no row written; a missing observation, never N/A (DM-2026-01)")
     _resolve_col_origin(col_facts)
     n_cols = _write_src_columns(conn, source_id, spec, rect, col_facts, metric_ids, acct_ids)
     if n_skipped:
@@ -2610,6 +2656,14 @@ def _load_ssa_earnings_structural(conn, batch: Batch, spec: dict, source_id: int
             f"{spec['alias']}: series_start is not supported for the ssa_earnings "
             f"family (one row per work year, no per-column row grain) — declared: "
             f"{sorted(declared_starts)}")
+    # Same boundary for series_anchor_month: arming a guard on a family with no
+    # per-column row grain would be silently inert — refuse, never ignore.
+    declared_anchor_months = layout.get("series_anchor_month") or {}
+    if declared_anchor_months:
+        raise LoadError(
+            f"{spec['alias']}: series_anchor_month is not supported for the ssa_earnings "
+            f"family (one row per work year, no per-column row grain) — declared: "
+            f"{sorted(declared_anchor_months)}")
     roles = {}
     for label, (ci, _hdr, mapping) in rect.resolved.items():
         if mapping:

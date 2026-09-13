@@ -17,6 +17,14 @@ Drive, no private/ books, no owner values. Proves the per-column blank rule:
     a column contributes nothing — a blank is not a stated zero and not a
     missing observation — while AT/AFTER the start the anchored-blank guard is
     unchanged (the added negative test proves the guard is still non-vacuous);
+  * ARMING is DECLARATION-driven (`series_anchor_month`, DM-2026-01 follow-up):
+    a not_applicable column is armed iff it ALSO declares the calendar month in
+    which the series is meaningful — so a column whose mapping carries no grain
+    (the L/Deposit shape, which the grain-inference arming could never fire
+    for) is armed by its declaration, and grain alone arms nothing. Refusals:
+    a month outside 1..12, a declaration naming no resolvable column, one on a
+    column that is not not_applicable (silently inert), and the declaration on
+    the ssa_earnings family;
   * the report-only `SERIES SHAPE` detector names a single-month column, its
     count and share, and whether blank_means is declared, without changing what
     loads;
@@ -65,13 +73,15 @@ def cell(a1, kind="literal", value=None, **kw):
     return rec
 
 
-def allow(blank_means, series_start=None):
+def allow(blank_means, series_start=None, series_anchor_month=None):
     tabs = {"Synth Tab": {"header_row": 1, "first_data_row": 2, "key_column": "A",
                           "role": "raw", "grain": "month-end"}}
     if blank_means is not None:
         tabs["Synth Tab"]["blank_means"] = blank_means
     if series_start is not None:
         tabs["Synth Tab"]["series_start"] = series_start
+    if series_anchor_month is not None:
+        tabs["Synth Tab"]["series_anchor_month"] = series_anchor_month
     return {"sources": {"synthsrc": {"tabs": tabs}}}
 
 
@@ -101,6 +111,15 @@ METRICS = [
 
 # three live month-end rows; 2026-02 is absent from the source on purpose
 ROWS = [("2026-01-31", 2), ("2026-03-31", 3), ("2026-12-31", 4)]
+
+# The L/Deposit shape: same spec, but the not_applicable column's mapping
+# carries NO `grain` — exactly why the grain-inference arming could never fire
+# for it. Only a declared `series_anchor_month` may arm such a column.
+SPEC_NO_GRAIN = {**SPEC, "columns": [
+    {"col": "Date", "role": "as_of"},
+    {"col": "Alpha", "account": "ACCT_A", "metric": "MA"},
+    {"col": "Beta", "account": "ACCT_B", "metric": "MB"},
+]}
 
 
 def artifact(alpha, beta, last_row=4):
@@ -151,12 +170,12 @@ def artifact_dates(dates, alpha, beta):
     }
 
 
-def run(con, art, allowdict):
+def run(con, art, allowdict, spec=None):
     acct_ids, metric_ids = L.ensure_dims(con, DIMS, METRICS)
     with tempfile.TemporaryDirectory() as td:
         ap = Path(td) / "art.json"
         ap.write_text(json.dumps(art))
-        spec = {**SPEC, "artifact": str(ap)}
+        spec = {**(spec or SPEC), "artifact": str(ap)}
         with L.Batch(con, note="synthetic") as batch:
             res = L.load_structural_spec(con, batch, spec, allowdict, acct_ids, metric_ids)
     return res
@@ -183,7 +202,8 @@ def main() -> int:
     print("\n-- default zero + declared not_applicable (non-anchor blanks)")
     con = fresh()
     res = run(con, artifact([None, 1, 5], [None, 2, 7]), allow(
-        {"Beta": {"value": "not_applicable", "note": "synthetic evidence"}}))
+        {"Beta": {"value": "not_applicable", "note": "synthetic evidence"}},
+        None, {"Beta": 12}))
     check("load completes, not quarantined", res.get("quarantined") is False, res)
     check("no fact row for a not_applicable blank (non-anchor)",
           ("2026-01-31", "zero_from_blank") not in facts(con, "MB")
@@ -213,7 +233,8 @@ def main() -> int:
     print("\n-- NEGATIVE: blank at an EXPECTED anchor period fails loudly")
     con = fresh()
     res = run(con, artifact([None, 1, 5], [None, 2, None]), allow(
-        {"Beta": {"value": "not_applicable", "note": "synthetic evidence"}}))
+        {"Beta": {"value": "not_applicable", "note": "synthetic evidence"}},
+        None, {"Beta": 12}))
     finds = res.get("anchored_blanks") or []
     check("anchored blank IS reported (the guard can fail)", len(finds) == 1, finds)
     check("finding names column, period and row",
@@ -236,11 +257,13 @@ def main() -> int:
     print("\n-- escape hatch: a period declared expected=0 stays silent, visibly")
     con = fresh()
     run(con, artifact([None, 1, 5], [None, 2, None]), allow(
-        {"Beta": {"value": "not_applicable", "note": "synthetic evidence"}}))
+        {"Beta": {"value": "not_applicable", "note": "synthetic evidence"}},
+        None, {"Beta": 12}))
     # first load registered src_ref + coverage; now declare the anchor NOT expected
     con.execute("UPDATE coverage_calendar SET expected=0 WHERE period='2026-12'")
     res = run(con, artifact([None, 1, 5], [None, 2, None]), allow(
-        {"Beta": {"value": "not_applicable", "note": "synthetic evidence"}}))
+        {"Beta": {"value": "not_applicable", "note": "synthetic evidence"}},
+        None, {"Beta": 12}))
     check("expected=0 anchor does NOT fire the guard",
           res.get("anchored_blanks") == [], res.get("anchored_blanks"))
     check("the declared-not-expected period keeps expected=0",
@@ -250,7 +273,7 @@ def main() -> int:
     print("\n-- declaration forms and refusals")
     con = fresh()
     res = run(con, artifact([None, 1, 5], [None, 2, 7]),
-              allow({"Beta": "not_applicable"}))
+              allow({"Beta": "not_applicable"}, None, {"Beta": 12}))
     check("plain string form accepted",
           ("2026-01-31", "zero_from_blank") not in facts(con, "MB")
           and res.get("anchored_blanks") == [])
@@ -304,7 +327,7 @@ def main() -> int:
     con = fresh()
     res = run(con, artifact([None, 1, 5], [None, 2, None]),
               allow({"Beta": {"value": "not_applicable", "note": "synthetic"}},
-                    {"Beta": "2027-01"}))
+                    {"Beta": "2027-01"}, {"Beta": 12}))
     check("blank anchor BEFORE series_start is NOT a finding",
           res.get("anchored_blanks") == [], res.get("anchored_blanks"))
     check("blank anchor before series_start writes no row (N/A)",
@@ -319,7 +342,7 @@ def main() -> int:
     con = fresh()
     res = run(con, artifact([None, 1, 5], [None, 2, None]),
               allow({"Beta": {"value": "not_applicable", "note": "synthetic"}},
-                    {"Beta": "2026-01"}))
+                    {"Beta": "2026-01"}, {"Beta": 12}))
     finds = res.get("anchored_blanks") or []
     check("blank anchor AT/AFTER series_start still fires (guard non-vacuous)",
           len(finds) == 1 and finds[0]["period"] == "2026-12", finds)
@@ -332,7 +355,8 @@ def main() -> int:
     con = fresh()
     res = run(con, artifact([None, 1, 5], [None, 2, 7]),
               allow({"Beta": {"value": "not_applicable", "note": "synthetic"}},
-                    {"Beta": {"value": "2027-01", "note": "synthetic evidence"}}))
+                    {"Beta": {"value": "2027-01", "note": "synthetic evidence"}},
+                    {"Beta": 12}))
     zr = {c["label"]: c for c in (res.get("blank_report") or {}).get("columns", [])}
     check("object form of series_start accepted",
           res.get("anchored_blanks") == []
@@ -353,7 +377,7 @@ def main() -> int:
     con = fresh()
     res = run(con, artifact_dates(dec + jan, [7] * 8 + [None] * 8, [8] * 8 + [None] * 8),
               allow({"Beta": {"value": "not_applicable", "note": "synthetic"}},
-                    {"Beta": "2019-12"}))
+                    {"Beta": "2019-12"}, {"Beta": 12}))
     shapes = {s["label"]: s for s in (res.get("series_shapes") or [])}
     check("shape detector names single-month columns with >= 8 populated",
           set(shapes) == {"Alpha", "Beta"}, shapes)
@@ -418,6 +442,115 @@ def main() -> int:
     except L.LoadError as e:
         check("series_start on ssa_earnings refuses (no per-column row grain)",
               "series_start is not supported for the ssa_earnings family" in str(e), str(e))
+
+    print("\n-- ARMING is declaration-driven: series_anchor_month (DM-2026-01 follow-up)")
+    # The gap this closes: column L (Deposit) is not_applicable but its mapping
+    # carries NO grain, so the grain-inference arming could never fire for it —
+    # a guard that cannot fire for a column is not guarding it. Arming now comes
+    # from the declared series_anchor_month alone (COS decision: declare it,
+    # don't infer it).
+    con = fresh()
+    res = run(con, artifact([None, 1, 5], [None, 2, None]),
+              allow({"Beta": {"value": "not_applicable", "note": "synthetic"}},
+                    {"Beta": "2026-01"}, {"Beta": 12}), spec=SPEC_NO_GRAIN)
+    finds = res.get("anchored_blanks") or []
+    check("NEGATIVE (the L shape): not_applicable + declared series_anchor_month "
+          "ARMS the guard even with no grain on the mapping",
+          len(finds) == 1 and finds[0]["period"] == "2026-12", finds)
+    check("finding names the column, row and the DECLARED anchor month",
+          finds and finds[0]["column"] == "Beta" and finds[0]["row"] == 4
+          and finds[0].get("anchor_month") == 12, finds)
+    check("the L-shape anchored blank keeps the CLI's non-zero exit predicate",
+          bool(res.get("anchored_blanks")))
+    check("no row written for the L-shape anchored blank",
+          ("2026-12-31", "zero_from_blank") not in facts(con, "MB")
+          and ("2026-12-31", "measured") not in facts(con, "MB"), sorted(facts(con, "MB")))
+    check("batch note carries ANCHORED BLANK for the L-shape column",
+          "ANCHORED BLANK" in batch_note(con), batch_note(con))
+
+    # the other half of 'iff': grain alone does NOT arm anything any more.
+    con = fresh()
+    res = run(con, artifact([None, 1, 5], [None, 2, None]), allow(
+        {"Beta": {"value": "not_applicable", "note": "synthetic evidence"}}))
+    check("annual grain with NO series_anchor_month does NOT arm the guard "
+          "(declared, never inferred)",
+          res.get("anchored_blanks") == [], res.get("anchored_blanks"))
+    check("an unarmed not_applicable blank still writes no row (silence is a "
+          "visible absence of declaration, not a hidden skip)",
+          ("2026-12-31", "measured") not in facts(con, "MB")
+          and ("2026-12-31", "zero_from_blank") not in facts(con, "MB"),
+          sorted(facts(con, "MB")))
+
+    # object form accepted (value + evidence note), like blank_means/series_start
+    con = fresh()
+    res = run(con, artifact([None, 1, 5], [None, 2, None]), allow(
+        {"Beta": {"value": "not_applicable", "note": "synthetic"}},
+        {"Beta": "2026-01"},
+        {"Beta": {"value": 12, "note": "synthetic evidence"}}), spec=SPEC_NO_GRAIN)
+    check("object form of series_anchor_month accepted (guards fires)",
+          len(res.get("anchored_blanks") or []) == 1, res.get("anchored_blanks"))
+
+    # refusals: the declaration must never be silently inert
+    for bad, why in ((13, "month above 12"), (0, "month below 1"),
+                     ("12", "string, not an integer month"), (12.5, "not an integer")):
+        con = fresh()
+        try:
+            run(con, artifact([None, 1, 5], [None, 2, 7]), allow(
+                {"Beta": "not_applicable"}, None, {"Beta": bad}))
+            check(f"malformed series_anchor_month refuses ({why})", False, "no LoadError")
+        except L.LoadError as e:
+            check(f"malformed series_anchor_month refuses ({why})",
+                  "not a calendar month 1..12" in str(e), str(e))
+    con = fresh()
+    try:
+        run(con, artifact([None, 1, 5], [None, 2, 7]), allow(
+            {"Beta": "not_applicable"}, None, {"Gamma": 12}))
+        check("series_anchor_month naming no resolvable column refuses", False, "no LoadError")
+    except L.LoadError as e:
+        check("series_anchor_month naming no resolvable column refuses",
+              "no column of this spec resolves" in str(e), str(e))
+    con = fresh()
+    try:
+        # Alpha keeps the DEFAULT zero rule: an anchor month there would be inert
+        run(con, artifact([None, 1, 5], [None, 2, 7]), allow(None, None, {"Alpha": 12}))
+        check("series_anchor_month on a non-not_applicable column refuses "
+              "(silently inert)", False, "no LoadError")
+    except L.LoadError as e:
+        check("series_anchor_month on a non-not_applicable column refuses "
+              "(silently inert)",
+              "silently inert" in str(e) and "blank_means='not_applicable' first" in str(e),
+              str(e))
+    con = fresh()
+    try:
+        acct_ids, metric_ids = L.ensure_dims(con, DIMS, METRICS)
+        layout_ssa = allow(None, None, {"Taxed A": 12})["sources"]["synthsrc"]["tabs"]["Synth Tab"]
+        ssa_spec = {**SPEC, "alias": "synthsrc:ssa", "family": "ssa_earnings",
+                    "columns": [{"col": "Work Year", "role": "work_year"},
+                                {"col": "Taxed A", "role": "ss_taxed"},
+                                {"col": "Taxed B", "role": "medicare_taxed"}],
+                    "grain": "annual work year"}
+        ssa_art = artifact([None], [None])
+        ssa_art["cells"] = [cell("A1", value="Work Year"), cell("B1", value="Taxed A"),
+                            cell("C1", value="Taxed B"), cell("A2", value=2001),
+                            cell("B2", value=11)]
+        ssa_art["ingest_rectangle"] = {"first_row": 2, "last_row": 2,
+                                       "columns": ["A", "B", "C"], "derived": True}
+        ssa_art["returned_bounds"] = {"rows": 3, "cols": 3}
+        rect = L.declared_rectangle(ssa_spec, layout_ssa, ssa_art)
+        with L.Batch(con, note="synthetic") as batch:
+            L._load_ssa_earnings_structural(con, batch, ssa_spec, 1, layout_ssa,
+                                            ssa_art, rect, acct_ids, metric_ids)
+        check("series_anchor_month on ssa_earnings refuses (no per-column row grain)",
+              False, "no LoadError")
+    except L.LoadError as e:
+        check("series_anchor_month on ssa_earnings refuses (no per-column row grain)",
+              "series_anchor_month is not supported for the ssa_earnings family" in str(e),
+              str(e))
+    except sqlite3.IntegrityError as e:
+        # pre-declaration-arming loader: the declaration was silently ignored and
+        # the load ran on — exactly the inertness a refusal exists to prevent.
+        check("series_anchor_month on ssa_earnings refuses (no per-column row grain)",
+              False, f"declaration silently ignored ({e})")
 
     print(f"\n{PASS} passed, {FAIL} failed")
     if FAILURES:

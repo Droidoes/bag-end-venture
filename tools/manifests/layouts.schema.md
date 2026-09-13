@@ -100,14 +100,15 @@ do not re-derive):**
   **per-column zero report** (column → n zeros materialised) so an undeclared
   `not_applicable` column is visible in the report instead of being discovered
   by hand.
-- **The anchored-gap guard.** A `not_applicable` column whose metric grain is
-  coarser than the tab's row grain (e.g. an annual metric on a month-end
-  spine) has an **anchor period** (December). If an anchor period is *expected*
-  (`coverage_calendar.expected = 1`) and its cell is blank, that is a **missing
-  observation**: the loader reports it by column and period and the load exits
-  non-zero — it is never silently skipped as N/A. The only silence is a period
-  deliberately declared `expected = 0` in `coverage_calendar`, which is itself
-  a visible declaration.
+- **The anchored-gap guard.** A `not_applicable` column that ALSO declares
+  `series_anchor_month` (next section) is **armed**: if an anchor period is
+  *expected* (`coverage_calendar.expected = 1`) and its cell is blank, that is
+  a **missing observation**: the loader reports it by column and period and
+  the load exits non-zero — it is never silently skipped as N/A. The only
+  silence is a period deliberately declared `expected = 0` in
+  `coverage_calendar`, which is itself a visible declaration. (Arming is
+  declaration-driven — see `series_anchor_month` — never inferred from the
+  metric's grain.)
 - **Refusals.** A value outside the two, a declaration naming no column the
   spec resolves, or `blank_means` on a family whose rows carry row-grain
   presence across several value columns (`ssa_earnings`) all fail the load
@@ -158,6 +159,57 @@ where it begins, per column:
   `pre_start_skips` per column, and the shape detector (below) prints a
   report-only line for any column whose populated rows all fall in one calendar
   month.
+
+### Fields added 2026-09-12 — per-column anchor month (`series_anchor_month`)
+
+A `not_applicable` column is only GUARDED if the layout says which month is
+meaningful. The same tab entry may declare that month, per column:
+
+```jsonc
+"tabs": {
+  "<tab>": {
+    "role": "raw", "header_row": 1, "grain": "month-end",
+    "series_anchor_month": {
+      "<header label>": { "value": 12,                  // object form: value + evidence
+                          "note": "why this month is the meaningful one" },
+      "<header label>": 12                               // plain form is accepted too
+    }
+  }
+}
+```
+
+**Rules (DM-2026-01 follow-up, COS decision 2026-09-12 — implement, do not
+re-derive):**
+
+- **The three per-column fields divide the question three ways.**
+  `series_anchor_month` says *which month is meaningful* for a
+  `not_applicable` series; `series_start` says *from when*; `blank_means` says
+  *what a non-anchor blank is*. None of them answers another's question.
+- **It arms the anchored-blank guard, and arming is column-grain.** A column
+  is armed **iff** it declares `blank_means='not_applicable'` AND a
+  `series_anchor_month`, and the period is **at or after** its `series_start`.
+  The EXPECTATIONS the armed guard is tested against stay **tab-grain**, read
+  back from `coverage_calendar.expected` — that division is deliberate, and no
+  per-column expectation table exists (`coverage_calendar` is unchanged, and
+  still per tab, never per column).
+- **Declared, never inferred.** The value is an integer calendar month 1–12
+  (plain or `{value, note}` object, evidence in the `note` — typically:
+  populated points are 100% in that month, counts already published). A value
+  outside 1–12, one that is not an integer, a declaration naming no column the
+  spec resolves, a declaration on a column that is not `not_applicable`
+  (silently inert), or the declaration on the `ssa_earnings` family all fail
+  the load loudly (same refusals as `blank_means` / `series_start`).
+- **Why the declaration replaced grain-inference arming.** Arming used to be
+  inferred from the column mapping's grain (an annual metric on a month-end
+  spine → December). That inference could not fire for a column whose mapping
+  carries no grain — `Deposit (L)` on `stats / Net-Worth Data` — so a blank
+  December there was silently treated as N/A and never tested against the
+  expectations: **a guard that cannot fire for a column is not guarding it**
+  (the same vacuity class found four times already in this work). The
+  declaration is the fix.
+- **Loader behaviour.** Armed findings keep flowing to the `ANCHORED BLANK`
+  report line, the batch note and the CLI's non-zero exit; each finding names
+  the declared anchor month.
 
 ### Fields added 2026-09-12 — series shape report (`SERIES SHAPE`)
 
