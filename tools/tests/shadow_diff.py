@@ -3,15 +3,25 @@
 three ways: **intended fix** / **bug** / **unknown**.
 
 Contract: docs/superpowers/plans/2026-09-12-structural-prefetch-v0.3.md §8 (P2),
-§10 (first wave), and the task's Deliverable B.5.
+§10 (first wave), Deliverable B.5, and DM-2026-01 (blank semantics).
 
 What it compares (counts, keys and nullness only — NEVER a financial value):
   * fact_state          for source alias `stats:net-worth-data`
   * ss_earnings_annual  for source alias `ss_earning:official-data`
 
-`zero_from_blank` is PRE-DECLARED as intended divergence: the legacy values-only
-CSV path skipped a blank cell, while the structural reader materialises every
-in-rectangle blank as a stated zero, so row counts are expected to rise.
+`zero_from_blank` is **derived per column from the declarations**
+(DM-2026-01) — never pre-declared as a blanket intended divergence:
+
+  * a `zero_from_blank` row for a metric whose column declares
+    `blank_means='not_applicable'` is a **bug** — exactly the hiding place the
+    decision memo warns about;
+  * a `zero_from_blank` row for any other column is the **intended fix** (the
+    ratified default: a blank cell inside a live row is a stated zero), derived
+    at run time by joining the allow-list (`private/layouts/layouts.json`,
+    label -> rule) with the curation map (label -> metric) — the same join the
+    loader performs;
+  * if either declaration file is unreadable the verdict is **unknown**
+    (fail closed), and an unreviewed unknown exits non-zero.
 
 Exit status: 0 when every difference is an intended fix (or there is no shadow
 store to diff); 1 when any difference is a bug or remains unknown/unreviewed.
@@ -19,21 +29,19 @@ store to diff); 1 when any difference is a bug or remains unknown/unreviewed.
 Run from the repo root:
     python3 tools/tests/shadow_diff.py [--live private/books.db]
                                        [--shadow private/books-shadow.db]
+                                       [--layouts private/layouts/layouts.json]
+                                       [--curation private/curation/v021_wave1.json]
 """
 from __future__ import annotations
 
 import argparse
+import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# PRE-DECLARED intended divergence (blueprint v0.3 §8 row P2 and §4 blank rule).
-PRE_DECLARED_INTENDED = {
-    "zero_from_blank": "an in-rectangle blank is a STATED zero (§3/§4); the legacy "
-                       "values-only CSV skipped it, so materialising blanks must add rows",
-}
-
 # Differences already REVIEWED against source evidence, keyed by a stable
 # signature so a NEW unreviewed difference of the same shape is caught (the
 # harness checks the observed count against `expect`). Dimension tokens only —
@@ -160,16 +168,84 @@ def diff_table(table, alias, live_rows, shadow_rows, differences, notes):
                  f"delta={len(shadow_rows) - len(live_rows):+d}")
 
 
-def sig(d: dict):
-    return (d["table"], d["alias"], d["account"], d["metric"], d["kind"],
-            d.get("presence"), d.get("origin"))
+# ------------------------------------------------- DM-2026-01 declarations join
+def _join_norm(s) -> str:
+    """Same normalisation the loader uses for the (alias, tab) join."""
+    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
 
 
-def classify(d: dict) -> str:
+def _label_key(s) -> str:
+    return " ".join(str(s).split()).casefold()
+
+
+def load_declarations(layouts_path: Path, curation_path: Path):
+    """Derive the per-alias set of metrics whose columns declare
+    `blank_means='not_applicable'`, by joining the two DECLARED sources of truth
+    exactly as the loader does: layouts.json (tab entry, label -> rule) x the
+    curation column map (label -> metric). Returns (na_metrics, lines, ok)."""
+    try:
+        layouts = json.loads(Path(layouts_path).read_text())
+        curation = json.loads(Path(curation_path).read_text())
+    except Exception as e:  # fail closed: unreadable declarations must not widen the intended set
+        return {}, [f"declarations UNAVAILABLE ({e}) — zero_from_blank divergences "
+                    f"are UNKNOWN (fail closed)"], False
+    na: dict[str, set] = {}
+    lines: list[str] = []
+    for spec in curation.get("sources", []):
+        alias = spec.get("alias") or ""
+        base = alias.split(":", 1)[0]
+        src_key = next((k for k in layouts.get("sources", {})
+                        if _join_norm(k) == _join_norm(base)), None)
+        if src_key is None:
+            continue
+        tabs = layouts["sources"][src_key].get("tabs", {})
+        tab_key = next((k for k in tabs
+                        if _join_norm(k) == _join_norm(spec.get("tab", ""))), None)
+        if tab_key is None:
+            continue
+        bm = tabs[tab_key].get("blank_means") or {}
+        declared = {}
+        for label, rule in bm.items():
+            value = rule.get("value") if isinstance(rule, dict) else rule
+            if value == "not_applicable":
+                declared[_label_key(label)] = label
+        if not declared:
+            continue
+        metrics: set = set()
+        parts: list[str] = []
+        for c in spec.get("columns", []):
+            if _label_key(c.get("col")) in declared and c.get("metric"):
+                metrics.add(c["metric"])
+                parts.append(f"{c['col']} -> {c['metric']}")
+        if metrics:
+            na[alias] = metrics
+            lines.append(f"  declarations [{alias}]: blank_means=not_applicable on "
+                         + ", ".join(sorted(parts)))
+    if not lines:
+        lines.append("  declarations: no not_applicable column declared for the "
+                     "diffed aliases (every blank cell is a stated zero by default)")
+    lines.append("  (zero_from_blank is derived from these declarations per column — "
+                 "DM-2026-01 — not pre-declared as blanket divergence)")
+    return na, lines, True
+
+
+def zfb_verdict(d: dict, na: dict, decl_ok: bool) -> str:
+    """DM-2026-01 classification of a zero_from_blank divergence, per column:
+    declared not_applicable -> bug (the hiding place the memo warns about);
+    anything else -> intended fix (the ratified default, derived from the
+    declarations); unreadable declarations -> unknown (fail closed)."""
+    if not decl_ok:
+        return "unknown"
+    if d.get("metric") in na.get(d["alias"], set()):
+        return "bug"
+    return "intended"
+
+
+def classify(d: dict, na: dict, decl_ok: bool) -> str:
     """Rules first; anything not explained here must be REVIEWED or it is unknown."""
     if d["kind"] == "added":
         if d.get("presence") == "zero_from_blank":
-            return "intended"                       # pre-declared
+            return zfb_verdict(d, na, decl_ok)      # derived per column (DM-2026-01)
         if d.get("origin") in ("derived", "external", "copy"):
             return "intended"                       # structural derivation now visible
         if d.get("presence") == "estimated":
@@ -180,12 +256,15 @@ def classify(d: dict) -> str:
     if d["kind"] == "presence":
         if d.get("old_presence") == "measured" and d.get("presence") in (
                 "zero_from_blank", "estimated"):
-            return "intended"
+            return zfb_verdict(d, na, decl_ok) if d.get("presence") == "zero_from_blank" \
+                else "intended"
         return "unknown"
     if d["kind"] == "value_null":
         if d.get("old") == "null" and d.get("new") == "set":
             return "intended"                       # blank/placeholder now a stated value
         return "bug"                                # a value vanished -> data loss
+    if d["kind"] == "zfb-under-not-applicable":
+        return "bug"
     return "unknown"
 
 
@@ -193,6 +272,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--live", default="private/books.db")
     ap.add_argument("--shadow", default="private/books-shadow.db")
+    ap.add_argument("--layouts", default="private/layouts/layouts.json")
+    ap.add_argument("--curation", default="private/curation/v021_wave1.json")
     args = ap.parse_args()
     live_p, shadow_p = Path(args.live), Path(args.shadow)
     if not live_p.exists():
@@ -211,17 +292,41 @@ def main() -> int:
     print("== shadow vs live — first wave (stats / ss_earning) ==")
     print(f"live   {live_p}  schema={live.execute('SELECT value FROM _schema_meta').fetchone()[0]}")
     print(f"shadow {shadow_p}  schema={shadow.execute('SELECT value FROM _schema_meta').fetchone()[0]}")
-    for name, why in PRE_DECLARED_INTENDED.items():
-        print(f"  pre-declared intended divergence: {name} — {why}")
+
+    # DM-2026-01: the intended-divergence set is DERIVED from the declarations
+    na, decl_lines, decl_ok = load_declarations(Path(args.layouts), Path(args.curation))
+    for line in decl_lines:
+        print(line)
 
     alias_stats = "stats:net-worth-data"
     alias_ss = "ss_earning:official-data"
+    shadow_fact = fact_rows(shadow, smap, alias_stats)
+    shadow_ss = ss_rows(shadow, smap, alias_ss)
     diff_table("fact_state", alias_stats,
-               fact_rows(live, lmap, alias_stats), fact_rows(shadow, smap, alias_stats),
-               differences, notes)
+               fact_rows(live, lmap, alias_stats), shadow_fact, differences, notes)
     diff_table("ss_earnings_annual", alias_ss,
-               ss_rows(live, lmap, alias_ss), ss_rows(shadow, smap, alias_ss),
-               differences, notes)
+               ss_rows(live, lmap, alias_ss), shadow_ss, differences, notes)
+
+    # store-side audit of the declarations: a not_applicable column must carry
+    # ZERO zero_from_blank rows in the shadow — else the guard was bypassed.
+    for rows, table, tab_alias in ((shadow_fact, "fact_state", alias_stats),
+                                   (shadow_ss, "ss_earnings_annual", alias_ss)):
+        inv: dict = {}
+        for r in rows.values():
+            if r.get("presence") == "zero_from_blank":
+                key = r.get("metric") or "<row-grain>"
+                inv[key] = inv.get(key, 0) + 1
+        if inv:
+            notes.append(f"{table} [{tab_alias}]: zero_from_blank inventory: "
+                         + ", ".join(f"{k}={v}" for k, v in sorted(inv.items())))
+        for metric in sorted(na.get(tab_alias, set())):
+            n_bad = inv.get(metric, 0)
+            if n_bad:
+                differences.append({
+                    "table": table, "alias": tab_alias,
+                    "kind": "zfb-under-not-applicable", "account": None, "metric": metric,
+                    "presence": "zero_from_blank", "origin": None, "count": n_bad,
+                })
 
     # classify, honouring the reviewed ledger and verifying its expected counts
     buckets = {"intended": 0, "bug": 0, "unknown": 0}
@@ -229,14 +334,21 @@ def main() -> int:
     observed_reviewed: dict = {}
     unresolved: list[str] = []
     for d in differences:
-        verdict = classify(d)
+        verdict = classify(d, na, decl_ok)
         s = sig(d)
         if verdict == "unknown" and s in REVIEWED:
             verdict = "intended"
             observed_reviewed[s] = observed_reviewed.get(s, 0) + 1
         buckets[verdict] += 1
         if verdict == "intended":
-            tag = "rule:" + (d.get("presence") or "?") if s not in REVIEWED else "reviewed"
+            if s in REVIEWED:
+                tag = "reviewed"
+            elif d.get("presence") == "zero_from_blank":
+                tag = "rule:zero_from_blank(derived-default-zero)"
+            else:
+                tag = "rule:" + (d.get("presence") or d["kind"] or "?")
+        elif d["kind"] == "zfb-under-not-applicable":
+            tag = "bug:zero_from_blank-under-not_applicable"
         else:
             tag = verdict
         by_rule[tag] = by_rule.get(tag, 0) + 1
@@ -267,7 +379,7 @@ def main() -> int:
     drift = [u for u in unresolved if u.startswith("REVIEWED count changed")]
     per_table: dict = {}
     for d in differences:
-        verdict = classify(d)
+        verdict = classify(d, na, decl_ok)
         s = sig(d)
         if verdict == "unknown" and s in REVIEWED:
             verdict = "intended"
@@ -287,6 +399,11 @@ def main() -> int:
         return 1
     print("shadow_diff PASSED: every difference is an intended fix")
     return 0
+
+
+def sig(d: dict):
+    return (d["table"], d["alias"], d["account"], d["metric"], d["kind"],
+            d.get("presence"), d.get("origin"))
 
 
 if __name__ == "__main__":

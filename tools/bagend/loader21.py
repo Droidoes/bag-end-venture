@@ -9,6 +9,25 @@ schema-version + foreign_keys assertion on connect · legal (origin, presence)
 pair enforcement (blueprint v0.3 §4; SQL composite CHECK sees only row-grain
 values, origin's column-grain default lives on src_column, so the loader asserts).
 
+Blank semantics (DM-2026-01): a blank cell inside an existing live row means 0
+(presence='zero_from_blank') unless the column DECLARES
+blank_means='not_applicable' in the allow-list — then no row is written. The
+loader prints a per-column zero report at load, emits coverage_calendar
+expectations for the tabs it loads structurally, and fails loudly (report line
++ non-zero exit at the CLI) when an EXPECTED anchor period of a not_applicable
+column is blank: a missing observation is never silently skipped as N/A.
+
+Series start (DM-2026-01 owner confirmation): a column MAY also DECLARE
+`series_start` ('YYYY-MM') in the allow-list — the layout statement of where a
+column's series begins ("the layout declares where the series begins", the
+ratified precedent for the Tax Rates rows). Before its start a column
+contributes nothing: a blank there is not a stated zero and not a missing
+observation, and the anchored-blank guard does not expect an anchor before the
+start. It resolves the three 1996-1998 `Total IRS Income` findings without a
+per-column coverage table: those years are folded into the first stated point
+and are genuinely N/A. At or after the start the guard is unchanged — a blank
+anchor still fails the load loudly.
+
 Curation (what loads, and how each column maps) lives in
 private/curation/*.json — this module is method only.
 """
@@ -1589,6 +1608,226 @@ def allow_list_entry(allow: dict, alias: str, tab: str, where: str) -> tuple:
     return src_key, tab_key, tabs[tab_key]
 
 
+# ---------------------------------------------------------------- blank semantics (DM-2026-01)
+# A blank cell inside an existing live row means 0 (presence='zero_from_blank')
+# unless the column DECLARES blank_means='not_applicable' in the allow-list —
+# then the cell has no meaningful value at that row and NO row is written.
+# Two values only; a cell-level 'not_recorded' does not exist: absent rows and
+# absent periods are coverage_calendar's business, never blank_means'.
+
+BLANK_MEANS_VALUES = ("zero", "not_applicable")
+
+
+def blank_rule_value(rule) -> tuple[str, str | None]:
+    """Accept the plain form ('not_applicable') or the object form
+    ({'value': …, 'note': evidence}); return (value, note). Refuse the rest."""
+    note = None
+    if isinstance(rule, dict):
+        note = rule.get("note")
+        rule = rule.get("value")
+    if rule not in BLANK_MEANS_VALUES:
+        raise LoadError(
+            f"blank_means value {rule!r} is not one of {BLANK_MEANS_VALUES} "
+            f"(DM-2026-01: 'zero' is the default and may be omitted)")
+    return rule, note
+
+
+def blank_rules_for(layout: dict, spec: dict, rect: "_Rect") -> dict[int, str]:
+    """Per-column blank rule from the allow-list tab entry's `blank_means` map —
+    declared, never inferred (DM-2026-01). Returns {col_index: rule} covering
+    every column the spec resolves (default 'zero'). Fails loud on a malformed
+    value or a declaration that names no resolvable column."""
+    declared = layout.get("blank_means") or {}
+    by_label: dict[str, str] = {}
+    for label, raw in declared.items():
+        value, _note = blank_rule_value(raw)
+        by_label[_label_key(label)] = value
+    rules: dict[int, str] = {}
+    unmatched = dict(by_label)
+    for label, (ci, _hdr, _mapping) in rect.resolved.items():
+        hit = by_label.get(_label_key(label))
+        rules[ci] = hit if hit is not None else "zero"
+        unmatched.pop(_label_key(label), None)
+    if unmatched:
+        raise LoadError(
+            f"{spec['alias']}: blank_means declares column(s) {sorted(unmatched)} "
+            f"that no column of this spec resolves — fix the allow-list entry "
+            f"(declarations are block-scoped to the tab entry)")
+    return rules
+
+
+SERIES_START_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])$")
+_MONTH_NAMES = (None, "January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December")
+# The shape detector's floor: a column whose populated cells all fall in one
+# calendar month with this many of them is an annual-in-practice series.
+SERIES_SHAPE_MIN_POPULATED = 8
+
+
+def series_start_value(rule) -> tuple[str, str | None]:
+    """Accept the plain form ('1999-12') or the object form
+    ({'value': …, 'note': evidence}); return (value, note). Refuse the rest —
+    a series start that is not a calendar month is not a boundary."""
+    note = None
+    if isinstance(rule, dict):
+        note = rule.get("note")
+        rule = rule.get("value")
+    if not isinstance(rule, str) or not SERIES_START_RE.match(rule.strip()):
+        raise LoadError(
+            f"series_start value {rule!r} is not a 'YYYY-MM' month — a column "
+            f"contributes nothing before its declared series start")
+    return rule.strip(), note
+
+
+def series_starts_for(layout: dict, spec: dict, rect: "_Rect") -> dict[int, tuple]:
+    """Per-column series start from the allow-list tab entry's `series_start` map
+    (declared, never inferred — same pattern as blank_means). Returns
+    {col_index: (start, note)}. Fails loud on a malformed value or a declaration
+    that names no resolvable column."""
+    declared = layout.get("series_start") or {}
+    by_label: dict[str, tuple] = {}
+    for label, raw in declared.items():
+        by_label[_label_key(label)] = series_start_value(raw)
+    starts: dict[int, tuple] = {}
+    unmatched = dict(by_label)
+    for label, (ci, _hdr, _mapping) in rect.resolved.items():
+        hit = by_label.get(_label_key(label))
+        if hit is not None:
+            starts[ci] = hit
+            unmatched.pop(_label_key(label), None)
+    if unmatched:
+        raise LoadError(
+            f"{spec['alias']}: series_start declares column(s) {sorted(unmatched)} "
+            f"that no column of this spec resolves — fix the allow-list entry "
+            f"(declarations are block-scoped to the tab entry)")
+    return starts
+
+
+def series_shape_lines(rect: "_Rect", pop_months: dict, blank_rules: dict,
+                       series_starts: dict) -> list[dict]:
+    """REPORT ONLY (DM-2026-01 follow-up, shape detector): for each mapped column
+    whose populated cells all fall in a single calendar month — and there are at
+    least SERIES_SHAPE_MIN_POPULATED of them — describe the shape as
+    'annual-in-practice' and say whether blank_means is declared.
+
+    It reads only WHICH rows are populated (classifier metadata: blank vs a cell
+    the reader accepted) and their calendar month — never a value. Its output is
+    a report line, never a failure: the counts-only zero report could not tell
+    `Deposit (L): zeros=301` (wrong) from a full-spine balance column
+    `Plan 401K (G): zeros=300` (right); the shape can."""
+    shapes: list[dict] = []
+    for label, (ci, _hdr, mapping) in sorted(rect.resolved.items(),
+                                             key=lambda kv: kv[1][0]):
+        if mapping is None or mapping.get("role") in ("as_of", "work_year"):
+            continue
+        per_month = pop_months.get(ci) or {}
+        populated = sum(per_month.values())
+        if populated < SERIES_SHAPE_MIN_POPULATED or len(per_month) != 1:
+            continue
+        month, count = next(iter(per_month.items()))
+        rule = blank_rules.get(ci, "zero")
+        declared = ("blank_means declared not_applicable" if rule == "not_applicable"
+                    else "blank_means NOT declared (default zero)")
+        start = (series_starts.get(ci) or (None, None))[0]
+        line = (f"SERIES SHAPE  {label} ({col_letters(ci)}): {populated} populated, "
+                f"{round(100 * count / populated)}% {_MONTH_NAMES[month]} "
+                f"-> annual-in-practice; {declared}")
+        if start:
+            line += f"; series_start={start}"
+        shapes.append({"label": label, "letters": col_letters(ci),
+                       "populated": populated, "month": month,
+                       "share_pct": round(100 * count / populated),
+                       "blank_means": rule, "series_start": start, "line": line})
+    return shapes
+
+
+def anchor_month_for(column_grain, tab_grain, where: str) -> int | None:
+    """The month whose cell is EXPECTED to carry an observation for a column
+    whose metric grain is coarser than the tab's row grain (DM-2026-01). Only
+    'annual' on a month-based spine is supported (anchor = December); a
+    same-grain or undeclared column has no anchor; anything else coarser
+    refuses rather than guesses an anchor."""
+    if not column_grain:
+        return None
+    cg = str(column_grain).strip().lower()
+    tg = str(tab_grain or "").strip().lower()
+    if not tg or cg == tg:
+        return None
+    if tg.startswith("month") and cg == "annual":
+        return 12
+    raise LoadError(
+        f"{where}: no anchored-blank rule for column grain {column_grain!r} on a "
+        f"{tab_grain!r} tab — declare the expectation in coverage_calendar "
+        f"instead of guessing")
+
+
+def _emit_period_coverage(conn, alias: str, tab: str, periods_live: set[str]) -> None:
+    """Declare the tab's expected periods (DM-2026-01 boundary: absent rows and
+    periods are coverage_calendar's business, never blank_means'). Every month
+    in the span the live rows occupy is expected: 'loaded' where a live row
+    exists, 'absent-in-source' where the source has none — recorded, never
+    zeroed."""
+    if not periods_live:
+        return
+    first, last = min(periods_live), max(periods_live)
+    y, m = int(first[:4]), int(first[5:7])
+    ey, em = int(last[:4]), int(last[5:7])
+    cov: dict[str, str] = {}
+    while (y, m) <= (ey, em):
+        p = f"{y:04d}-{m:02d}"
+        cov[p] = "loaded" if p in periods_live else "absent-in-source"
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+    coverage(conn, alias, tab, cov,
+             note="structural coverage: one expected month-end per live row; "
+                  "months the source lacks are absent-in-source, never zeroed "
+                  "(DM-2026-01)")
+
+
+def _anchored_blank_findings(conn, spec: dict, anchored: dict) -> list[dict]:
+    """DM-2026-01 guard: a blank cell at an EXPECTED anchor period of a
+    not_applicable column is a missing observation, not N/A. Expectations are
+    read back from coverage_calendar.expected (their declared home), so a
+    period deliberately declared expected=0 stays silent — visibly."""
+    if not anchored:
+        return []
+    expected = {r[0] for r in conn.execute(
+        "SELECT period FROM coverage_calendar WHERE source_alias=? AND tab=? "
+        "AND expected=1 AND period GLOB '????-12'",
+        (spec["alias"], spec["tab"]))}
+    return [f for (_ci, _year), f in sorted(anchored.items()) if f["period"] in expected]
+
+
+def _print_blank_report(alias: str, extras: dict) -> None:
+    """Per-column zero report at load (DM-2026-01 follow-up): an undeclared
+    not_applicable column shows up here instead of being discovered by hand."""
+    report = (extras or {}).get("zero_report") or {}
+    cols = report.get("columns") or []
+    if not cols:
+        return
+    print(f"  blank report {alias} (DM-2026-01): column -> zeros materialised", flush=True)
+    for c in cols:
+        extra = ""
+        if c.get("series_start"):
+            extra += f" series_start={c['series_start']}"
+        if c.get("pre_start_skips"):
+            extra += f" pre_start_skips={c['pre_start_skips']}"
+        print(f"    {c['label']} ({c['letters']}): zeros={c['zeros']} "
+              f"not_applicable_skips={c['not_applicable']} blanks_seen={c['blanks']}"
+              f"{extra}", flush=True)
+    for extra in (report.get("row_zero_from_blank"), None):
+        if extra:
+            print(f"    row-grain zero_from_blank rows: {extra}", flush=True)
+    # Report-only shape detector (DM-2026-01 follow-up): never a failure.
+    for sh in (extras or {}).get("series_shapes") or []:
+        print(f"  {sh['line']}", flush=True)
+    for f in (extras or {}).get("anchored_blanks") or []:
+        print(f"  !! ANCHORED BLANK {alias}: column {f['column']} ({f['letters']}) "
+              f"period {f['period']} is expected for a {f['grain']} metric but blank — "
+              f"no row written; a missing observation, never N/A (DM-2026-01)", flush=True)
+
+
 class _Rect:
     def __init__(self, header_row, group_row, sub_header_row, first_data_row,
                  skip_rows, last_data_row, resolved, key_col, external_cols,
@@ -2120,7 +2359,7 @@ def _live_rows(artifact: dict, rect: _Rect, spec: dict):
 
 
 def _load_state_structural(conn, batch: Batch, spec: dict, source_id: int, layout: dict,
-                           artifact: dict, rect: _Rect, acct_ids, metric_ids) -> int:
+                           artifact: dict, rect: _Rect, acct_ids, metric_ids) -> tuple:
     idx = {c["a1"]: c for c in artifact.get("cells", [])}
     ctx = _CellCtx(idx, rect.external_cols, rect.derived_cols, layout, spec)
     col_facts: dict = {}
@@ -2132,6 +2371,31 @@ def _load_state_structural(conn, batch: Batch, spec: dict, source_id: int, layou
     row_totals: dict = {}
     n = 0
     n_skipped = 0
+    # DM-2026-01 blank semantics: per-column rule, per-column visibility, and
+    # the anchored-blank guard against coverage_calendar.expected.
+    blank_rules = blank_rules_for(layout, spec, rect)
+    # DM-2026-01 owner confirmation: the allow-list MAY also declare where a
+    # column's series begins (series_start). Before that boundary the column
+    # contributes nothing — no stated zero, and no expected anchor.
+    series_starts = series_starts_for(layout, spec, rect)
+    tab_grain = layout.get("grain") or spec.get("grain")
+    anchors: dict[int, int] = {}      # col_index -> anchor month (only not_applicable columns)
+    for label, (ci, _hdr, mapping) in rect.resolved.items():
+        if mapping is None or mapping.get("role") in ("as_of", "work_year"):
+            continue
+        if blank_rules.get(ci, "zero") != "not_applicable":
+            continue
+        am = anchor_month_for(mapping.get("grain"), tab_grain,
+                              f"{spec['alias']} column {label!r}")
+        if am is not None:
+            anchors[ci] = am
+    blank_seen: dict[int, int] = {}   # col_index -> blank cells seen
+    zero_written: dict[int, int] = {} # col_index -> zero_from_blank rows materialised
+    na_skipped: dict[int, int] = {}   # col_index -> not_applicable blanks (no row)
+    pre_start_skips: dict[int, int] = {}  # col_index -> blanks before series_start (no row)
+    pop_months: dict[int, dict] = {}  # col_index -> {calendar month: populated rows}
+    anchored: dict = {}               # (col_index, year) -> finding
+    period_months: set[str] = set()
     for rowno, keyv in _live_rows(artifact, rect, spec):
         as_of, d_reason = coerce_date(keyv, fmt=spec.get("date_format"))
         if as_of and spec.get("month_end") and len(as_of) == 7:
@@ -2141,6 +2405,7 @@ def _load_state_structural(conn, batch: Batch, spec: dict, source_id: int, layou
         if as_of is None:
             issues.append(f"row {rowno}: key {d_reason}")
             continue
+        period_months.add(as_of[:7])
         row_sum = 0.0
         for label, (ci, _hdr, mapping) in rect.resolved.items():
             if mapping is not None and mapping.get("role") == "as_of":
@@ -2162,11 +2427,40 @@ def _load_state_structural(conn, batch: Batch, spec: dict, source_id: int, layou
             else:
                 cls = classify_cell(cell, ci, ctx)
                 _apply_cell_facts(col_facts, ci, cls)
+                # a blank is an artifact blank (or a spill of one); a formula
+                # copying a blank is a formula observation, never a blank
+                is_blank = (cls.get("presence") == "zero_from_blank"
+                            and not cls.get("copy_of")
+                            and not cls.get("merge_shadow_of"))
+                if is_blank:
+                    blank_seen[ci] = blank_seen.get(ci, 0) + 1
             if mapping is None:
                 continue   # declared skip column: classified, not ingested
+            start = (series_starts.get(ci) or (None, None))[0]
+            before_start = start is not None and as_of[:7] < start
             if not derive_mode:
                 if cls.get("skip_reason"):
                     issues.append(f"row {rowno} col {col_letters(ci)}: {cls['skip_reason']}")
+                    continue
+                if not is_blank:
+                    # Report-only shape observation: which rows are populated,
+                    # never a value (DM-2026-01 shape detector).
+                    pm = pop_months.setdefault(ci, {})
+                    pm[int(as_of[5:7])] = pm.get(int(as_of[5:7]), 0) + 1
+                # DM-2026-01: a declared not_applicable blank writes NO row; a
+                # blank BEFORE a declared series_start contributes nothing either
+                # (the series did not exist yet — not a zero, not a missing anchor).
+                if is_blank and (blank_rules.get(ci, "zero") == "not_applicable"
+                                 or before_start):
+                    na_skipped[ci] = na_skipped.get(ci, 0) + 1
+                    if before_start:
+                        pre_start_skips[ci] = pre_start_skips.get(ci, 0) + 1
+                    elif ci in anchors and as_of[5:7] == f"{anchors[ci]:02d}":
+                        anchored[(ci, as_of[:4])] = {
+                            "column": label, "letters": col_letters(ci),
+                            "row": rowno, "period": as_of[:7],
+                            "grain": mapping.get("grain"),
+                        }
                     continue
             if derive_mode:
                 continue
@@ -2201,6 +2495,8 @@ def _load_state_structural(conn, batch: Batch, spec: dict, source_id: int, layou
                  cls["origin"], cls["error_type"], grain, spec.get("grain"), h,
                  source_id, batch.batch_id, now()),
             )
+            if cls["presence"] == "zero_from_blank":
+                zero_written[ci] = zero_written.get(ci, 0) + 1
             if met == metric_ids.get("TOTAL_ASSETS") and val is not None:
                 row_sum += val
             n += 1
@@ -2233,6 +2529,16 @@ def _load_state_structural(conn, batch: Batch, spec: dict, source_id: int, layou
                  mapping.get("note"), h, source_id, batch.batch_id, now()),
             )
             n += 1
+    # DM-2026-01: absent rows/periods are coverage_calendar's business — declare
+    # the tab's expected months, then run the anchored-blank guard against
+    # coverage_calendar.expected so a missing observation fails loudly.
+    _emit_period_coverage(conn, spec["alias"], spec["tab"], period_months)
+    anchored_findings = _anchored_blank_findings(conn, spec, anchored)
+    for f in anchored_findings:
+        issues.append(
+            f"ANCHORED BLANK col {f['letters']} ({f['column']}): period {f['period']} "
+            f"is expected for a {f['grain']} metric but blank — no row written; "
+            f"a missing observation, never N/A (DM-2026-01)")
     _resolve_col_origin(col_facts)
     n_cols = _write_src_columns(conn, source_id, spec, rect, col_facts, metric_ids, acct_ids)
     if n_skipped:
@@ -2241,7 +2547,19 @@ def _load_state_structural(conn, batch: Batch, spec: dict, source_id: int, layou
         note = "; ".join(issues[:8]) + (f" (+{len(issues) - 8} more)" if len(issues) > 8 else "")
         conn.execute("UPDATE load_batch SET note=COALESCE(note,'')||' | '||? WHERE batch_id=?",
                      (note, batch.batch_id))
-    return n, n_cols
+    zero_report = {"columns": [
+        {"label": label, "letters": col_letters(ci),
+         "zeros": zero_written.get(ci, 0),
+         "not_applicable": na_skipped.get(ci, 0),
+         "blanks": blank_seen.get(ci, 0),
+         "pre_start_skips": pre_start_skips.get(ci, 0),
+         "series_start": (series_starts.get(ci) or (None, None))[0]}
+        for label, (ci, _hdr, mapping) in sorted(rect.resolved.items(), key=lambda kv: kv[1][0])
+        if mapping is not None and mapping.get("role") not in ("as_of", "work_year")
+    ]}
+    shapes = series_shape_lines(rect, pop_months, blank_rules, series_starts)
+    return n, n_cols, {"zero_report": zero_report, "anchored_blanks": anchored_findings,
+                       "series_shapes": shapes}
 
 
 def _row_presence_origin(cells: list) -> tuple:
@@ -2271,10 +2589,27 @@ def _row_presence_origin(cells: list) -> tuple:
 
 
 def _load_ssa_earnings_structural(conn, batch: Batch, spec: dict, source_id: int, layout: dict,
-                                  artifact: dict, rect: _Rect, acct_ids, metric_ids) -> int:
+                                  artifact: dict, rect: _Rect, acct_ids, metric_ids) -> tuple:
     idx = {c["a1"]: c for c in artifact.get("cells", [])}
     ctx = _CellCtx(idx, rect.external_cols, rect.derived_cols, layout, spec)
     col_facts: dict = {}
+    # DM-2026-01: blank_means is a per-CELL column rule; this family writes ONE
+    # row per work year whose presence spans two value columns, so a not_
+    # applicable declaration has no defined meaning here — refuse, never ignore.
+    declared_blank_means = layout.get("blank_means") or {}
+    if declared_blank_means:
+        raise LoadError(
+            f"{spec['alias']}: blank_means is not supported for the ssa_earnings "
+            f"family (row-grain presence spans two value columns) — declared: "
+            f"{sorted(declared_blank_means)}")
+    # Same boundary for series_start: this family has no per-column row grain to
+    # bound, so a declaration here would be silently inert — refuse, never ignore.
+    declared_starts = layout.get("series_start") or {}
+    if declared_starts:
+        raise LoadError(
+            f"{spec['alias']}: series_start is not supported for the ssa_earnings "
+            f"family (one row per work year, no per-column row grain) — declared: "
+            f"{sorted(declared_starts)}")
     roles = {}
     for label, (ci, _hdr, mapping) in rect.resolved.items():
         if mapping:
@@ -2282,6 +2617,8 @@ def _load_ssa_earnings_structural(conn, batch: Batch, spec: dict, source_id: int
     n = 0
     years = set()
     issues: list[str] = []
+    blank_cells: dict[str, int] = {}
+    n_rows_zero = 0
     for rowno, keyv in _live_rows(artifact, rect, spec):
         try:
             work_year = int(float(str(keyv).strip()))
@@ -2298,12 +2635,17 @@ def _load_ssa_earnings_structural(conn, batch: Batch, spec: dict, source_id: int
                                                            "kind": "blank"}
             cls = classify_cell(cell, ci, ctx)
             _apply_cell_facts(col_facts, ci, cls)
+            if (cls.get("presence") == "zero_from_blank"
+                    and not cls.get("copy_of") and not cls.get("merge_shadow_of")):
+                blank_cells[role] = blank_cells.get(role, 0) + 1
             if cls.get("skip_reason"):
                 issues.append(f"row {rowno} col {col_letters(ci)}: {cls['skip_reason']}")
                 continue
             cells.append(cls)
             values[role] = cls
         presence, origin = _row_presence_origin(cells) if cells else ("zero_from_blank", "entered")
+        if presence == "zero_from_blank":
+            n_rows_zero += 1
         error_type = next((c["error_type"] for c in cells if c.get("error_type")), None)
         require_legal_pair(origin, presence, f"ss_earnings row {rowno}")
         ss = values.get("ss_taxed", {}).get("value_num")
@@ -2328,7 +2670,16 @@ def _load_ssa_earnings_structural(conn, batch: Batch, spec: dict, source_id: int
         note = "; ".join(issues[:8]) + (f" (+{len(issues) - 8} more)" if len(issues) > 8 else "")
         conn.execute("UPDATE load_batch SET note=COALESCE(note,'')||' | '||? WHERE batch_id=?",
                      (note, batch.batch_id))
-    return n
+    zero_report = {
+        "columns": [
+            {"label": role, "letters": col_letters(ci), "zeros": blank_cells.get(role, 0),
+             "not_applicable": 0, "blanks": blank_cells.get(role, 0)}
+            for role, ci in sorted(roles.items(), key=lambda kv: kv[1])
+            if role in ("ss_taxed", "medicare_taxed")
+        ],
+        "row_zero_from_blank": n_rows_zero,
+    }
+    return n, {"zero_report": zero_report, "anchored_blanks": []}
 
 
 def load_structural_spec(conn, batch: Batch, spec: dict, allow: dict, acct_ids, metric_ids) -> dict:
@@ -2346,16 +2697,20 @@ def load_structural_spec(conn, batch: Batch, spec: dict, allow: dict, acct_ids, 
         assert_artifact_coverage(artifact, rect, spec["alias"])
         assert_shape(artifact, rect, layout, spec)
         if spec["family"] == "state":
-            n, n_cols = _load_state_structural(conn, batch, spec, source_id, layout,
-                                               artifact, rect, acct_ids, metric_ids)
+            n, n_cols, extras = _load_state_structural(conn, batch, spec, source_id, layout,
+                                                       artifact, rect, acct_ids, metric_ids)
         elif spec["family"] == "ssa_earnings":
-            n = _load_ssa_earnings_structural(conn, batch, spec, source_id, layout,
-                                              artifact, rect, acct_ids, metric_ids)
+            n, extras = _load_ssa_earnings_structural(conn, batch, spec, source_id, layout,
+                                                      artifact, rect, acct_ids, metric_ids)
             n_cols = None
         else:
             raise LoadError(f"{spec['alias']}: structural reader has no implementation for "
                             f"family {spec['family']!r} (P2 first wave is stats + ss_earning)")
+        _print_blank_report(spec["alias"], extras)
         return {"rows": n, "quarantined": False, "src_columns": n_cols,
+                "blank_report": extras.get("zero_report"),
+                "anchored_blanks": extras.get("anchored_blanks", []),
+                "series_shapes": extras.get("series_shapes", []),
                 "artifact_sha256": artifact.get("artifact_sha256"),
                 "artifact": str(spec["artifact"])}
     except Quarantine as q:

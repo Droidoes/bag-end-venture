@@ -50,6 +50,132 @@ expressible with `header_row` alone. The fields are optional and only meaningful
 where the tab really has that shape; unresolved entries keep
 `header_row: "unresolved"` until a human confirms.
 
+### Fields added 2026-09-12 — per-column blank semantics (`blank_means`, DM-2026-01)
+
+A blank numeric cell **inside an existing live row** means **0** by default —
+the loader records it with `presence='zero_from_blank'`. A column may declare
+the exception on the tab entry:
+
+```jsonc
+"tabs": {
+  "<tab>": {
+    "role": "raw",
+    "header_row": 1,
+    "grain": "month-end",
+    "blank_means": {
+      "<header label>": { "value": "not_applicable",   // object form: value + evidence
+                          "note": "why this column is the exception" },
+      "<header label>": "not_applicable"               // plain form is accepted too
+    }
+  }
+}
+```
+
+**Rules (decided in `docs/decisions/DM-2026-01-blank-semantics.md` — implement,
+do not re-derive):**
+
+- **Two values only.** `zero` — the default, may be omitted entirely — and
+  `not_applicable`. There is **no cell-level `not_recorded`**: that concept's
+  home is `coverage_calendar` (`expected` + `absent-in-source` / `loaded-empty`
+  / `not-loaded`).
+- **Cell-level, nothing more.** It answers one question — what does a blank
+  cell inside an existing live row mean? `zero` → the blank is a stated 0;
+  `not_applicable` → the cell has no meaningful value at that row and **no row
+  is written**. Absent rows and absent periods are NOT this field's business —
+  `coverage_calendar` owns them, and they are never zeroed.
+- **Declared, never inferred.** Each declaration carries its evidence in the
+  entry's `note` (typically: the metric's period grain is coarser than the
+  tab's row grain, evidenced from already-declared fields — curation
+  `grain`, `dim_metric.methodology`, stored `period_grain` vs `src_tab.grain`).
+  Deriving the exception from grain fields was proposed and rejected.
+- **Block-scoped.** The map hangs off the tab entry because a column hangs off
+  `src_column.tab_id`. A tab MAY be registered as multiple blocks —
+  `src_tab.block` (`''` = whole tab; `UNIQUE (source_id, tab, block)`) already
+  exists in the store schema for exactly this and is currently **dormant**;
+  when blocks activate, each block's spec resolves the declarations against its
+  own header labels. Documented here for completeness; no behaviour change
+  today.
+- **Loader behaviour.** `zero` behaves exactly as before;
+  `not_applicable` writes no row for that cell. At load the loader prints a
+  **per-column zero report** (column → n zeros materialised) so an undeclared
+  `not_applicable` column is visible in the report instead of being discovered
+  by hand.
+- **The anchored-gap guard.** A `not_applicable` column whose metric grain is
+  coarser than the tab's row grain (e.g. an annual metric on a month-end
+  spine) has an **anchor period** (December). If an anchor period is *expected*
+  (`coverage_calendar.expected = 1`) and its cell is blank, that is a **missing
+  observation**: the loader reports it by column and period and the load exits
+  non-zero — it is never silently skipped as N/A. The only silence is a period
+  deliberately declared `expected = 0` in `coverage_calendar`, which is itself
+  a visible declaration.
+- **Refusals.** A value outside the two, a declaration naming no column the
+  spec resolves, or `blank_means` on a family whose rows carry row-grain
+  presence across several value columns (`ssa_earnings`) all fail the load
+  loudly. A formula that copies a blank cell is a formula observation, not a
+  blank; only artifact blanks (and spills of blanks) carry the column's
+  `blank_means`.
+
+### Fields added 2026-09-12 — per-column series start (`series_start`)
+
+A column's series may not begin with the tab. The same tab entry may DECLARE
+where it begins, per column:
+
+```jsonc
+"tabs": {
+  "<tab>": {
+    "role": "raw", "header_row": 1, "grain": "month-end",
+    "series_start": {
+      "<header label>": { "value": "1999-12",           // object form: value + evidence
+                          "note": "why the series starts here" },
+      "<header label>": "1999-12"                        // plain form is accepted too
+    }
+  }
+}
+```
+
+**Rules (DM-2026-01 owner confirmation, 2026-09-12 — implement, do not re-derive):**
+
+- **It is a declaration, not an inference.** The value is one `YYYY-MM` month; a
+  value that is not a calendar month, or a label that no column of the spec
+  resolves, fails the load loudly (same refusals as `blank_means`).
+- **Before the start a column contributes nothing.** A blank cell in a period
+  strictly before the declared start is neither a stated `0` nor a missing
+  observation: no row is written, and it is counted (report only) as a
+  pre-start skip. This is the column-grain application of the already-ratified
+  precedent for the Tax Rates rows 4–8 — *the layout declares where the series
+  begins*.
+- **The anchored-blank guard does not expect an anchor before the start.**
+  `coverage_calendar` keeps declaring the tab's expected periods (unchanged, and
+  still per tab, never per column); `series_start` is the per-column floor the
+  guard reads. At or after the start the guard is unchanged: a blank December
+  anchor still fails the load loudly with a non-zero exit. The only silence is a
+  period the declaration puts before the start — visibly.
+- **Why not a per-column coverage table.** The tab's period coverage and a
+  column's series span are different grains; the memo's own boundary keeps
+  `coverage_calendar` at the tab/period grain. A start declared on the column is
+  the smallest honest statement, and it needs no schema change.
+- **Loader behaviour.** The per-column zero report prints `series_start` and
+  `pre_start_skips` per column, and the shape detector (below) prints a
+  report-only line for any column whose populated rows all fall in one calendar
+  month.
+
+### Fields added 2026-09-12 — series shape report (`SERIES SHAPE`)
+
+At load the loader also prints one line per mapped column whose populated cells
+all fall in a **single calendar month** (and number at least 8), naming the
+column, the count, the share in that month, and whether `blank_means` is
+declared:
+
+```
+SERIES SHAPE  Deposit (L): 27 populated, 100% December -> annual-in-practice; blank_means declared not_applicable
+```
+
+It reads only **which** rows are populated and their calendar month — never a
+value. Its purpose is diagnostic: the counts-only zero report could not tell
+`Deposit (L): zeros=301` (wrong) from a full-spine balance column
+`Plan 401K (G): zeros=300` (right); the shape can. **Report only** — it never
+changes what is loaded and is never a failure.
+
 ## Roles — what the ingest tool does with each
 
 | role | behaviour |

@@ -294,6 +294,16 @@ def cmd_load(args: argparse.Namespace) -> None:
         elif isinstance(v, list):
             print(f"  {k}: {len(v)} spec(s)")
     print(f"load wave1 -> {_rel(db)} ({'structural' if args.structural else 'legacy'} path)")
+    # DM-2026-01 anchored-blank guard: an EXPECTED anchor period of a
+    # not_applicable column that is blank is a missing observation — the load
+    # itself completes (the rest of the tab is valid) but the command FAILS
+    # LOUDLY with a non-zero exit instead of silently skipping as N/A.
+    anchored = [(k, v["anchored_blanks"]) for k, v in sorted(res.items())
+                if isinstance(v, dict) and v.get("anchored_blanks")]
+    if anchored:
+        sys.exit("load wave1 FAILED: anchored blank(s) at expected period(s) of a "
+                 "blank_means='not_applicable' column — missing observation(s) "
+                 "reported above, never N/A (DM-2026-01)")
 
 
 def _connect_ro():
