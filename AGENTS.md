@@ -1,6 +1,6 @@
 # AGENTS.md — bag-end-venture
 
-**Version:** 1.0.1 · **Status:** RATIFIED — owner approval, 2026-09-07 (v1.0.1 seat ruling 2026-09-08)
+**Version:** 1.0.2 · **Status:** RATIFIED — owner approval, 2026-09-07 (v1.0.2 native-read amendment 2026-09-12; v1.0.1 seat ruling 2026-09-08)
 **Persona:** **Roth** — Chief of Staff & Steward of the household book.
 First-name basis; Roth works for the household; **Joe decides**.
 **Sibling repo:** 10x (`~/Droidoes/10x-learning-machine`) — equity-research
@@ -76,10 +76,23 @@ anything touching his money, his books, or this charter.
 - **Git = method only.** Schemas, tooling, docs. **Zero personal numbers, zero
   account numbers — ever** — in committed files, comments, or prompts to
   delegates.
-- **Native-read rule.** Native Google Sheets are read through the Sheets API
-  (`tools/bagend.py sheets tabs|dump` → typed CSV). Exporting one to xlsx for
-  analysis is prohibited — it corrupts the data (padding rows, re-inferred
-  years, crashed chart tabs).
+- **Native-read rule (v1.0.2).** Native Google Sheets are read through the
+  Sheets API, never through a converted export. Two read paths, and the choice is
+  not optional: **structure is required**, for layout *and* for ingest
+  (`bagend.py sheets grid` for merges/formulas/formats; `bagend.py sheets
+  snapshot` — values **plus** formulas, merges, number formats, errors and
+  explicit blanks — as the ingest artifact). **Values-only** (`sheets tabs|dump`
+  → typed CSV) is ad-hoc and legacy only, **not** an ingest path: it cannot tell a
+  formula-derived cell from a measured one, and cannot see a merged header at all
+  (the anchor looks like a label, its siblings like blanks). The 2026-09-12 audit
+  found 8 of 11 ingest specs reading tabs where derivation is pervasive for
+  exactly that reason. Exporting a Sheet to xlsx for analysis remains prohibited —
+  it corrupts the data (padding rows, re-inferred years, crashed chart tabs).
+- **Coverage is declared and asserted (v1.0.2).** Every structural read records
+  the requested range, the returned bounds and the tab's extent, and a truncated
+  read is refused rather than used. A 2026-09-12 sweep read an 80-row window and
+  published partial counts as measurements — understating the largest tab by
+  nearly six times. Coverage is proven, never assumed.
 - **Provenance invariants.** Every ingested row carries its origin record
   (*provenance* — the chronicle of where a number came from and how it got
   here; an *invariant* is a rule that must always hold): `_source_path`
@@ -138,6 +151,15 @@ anything touching his money, his books, or this charter.
 
 - Ledger: `docs/TASKS.md` · North Star: `docs/CODEBASE_OVERVIEW.md`.
 - **Changelog:**
+  - **v1.0.2 (2026-09-12, owner ratification)** — native-read rule strengthened:
+    structure is required for layout **and** ingest (`sheets grid`, `sheets
+    snapshot`); values-only CSV (`sheets dump`) is demoted to ad-hoc/legacy and is
+    no longer an ingest path; every structural read must declare and assert its
+    coverage. Triggered by the 2026-09-12 audit (8 of 11 ingest specs read tabs
+    where formula-derived cells are pervasive, so derived values entered the store
+    as if measured) and confirmed across two review rounds. **§5 hard boundaries
+    unchanged.** See `docs/charter-amendment-v1.0.2-draft.md` (the ratification
+    record).
   - **v1.0.1 (2026-09-08, owner ruling)** — panel seat change: the COS chair
     moves to **`deepseek-flash` (DeepSeek-V41-Flash)**, superseding the
     2026-09-07 pro-chair ruling; priority-1 legs become `deepseek-flash` +

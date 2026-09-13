@@ -174,6 +174,14 @@ investigation. The working rule now lives in the `session-catchup` skill: batch
 the reads, take one approval, and report the failure cause instead of letting it
 look like an empty result list.
 
+**Addendum, same day.** The owner later switched the session itself to
+`danger-full-access` with approvals disabled, which removes the constraint at the
+session level rather than at the tool level. So the rule above is now
+**conditional**: it governs *sandboxed* sessions only. In a full-access session
+`gws` is called normally, with no batching and no escalation. The underlying
+finding stands — the writable set is hardcoded, so no amount of configuration
+makes `~/.config/gws` writable under `workspace-write`.
+
 ---
 
 ## See also

@@ -128,12 +128,13 @@ calls with bash `sandbox_permissions="danger-full-access"`, or have the
 owner re-auth from their terminal. Pure-local steps (inspect, ingest, query
 after fetch) need no elevation.
 
-## Two read paths — and which to use
+## Three read paths — and which to use (charter v1.0.2)
 
 | Source kind | Command | Result |
 |---|---|---|
-| **native Google Sheet** | `sheets dump <alias> [--tab NAME]` | per-tab **CSV**, typed values, used-range only |
+| **native Google Sheet — INGEST** | `sheets snapshot <alias> --tab NAME [--with-notes]` | the **structural artifact** (JSON): values **plus** formulas, merges, number formats, errors, spills and explicit blanks, with requested/returned bounds, tab extent, a truncation flag and a content hash |
 | **native Google Sheet — layout** | `sheets grid <alias> --tab NAME` | **merges + formulas + formats** (JSON); no values unless `--with-values` |
+| **native Google Sheet — ad-hoc/legacy** | `sheets dump <alias> [--tab NAME]` | per-tab **CSV**, typed values, used-range only — **not an ingest path** |
 | **uploaded file** (xlsx/csv/pdf) | `fetch <alias>` | the original bytes, unchanged |
 
 **Values are not structure.** `sheets dump` calls `values.get`, which returns
@@ -144,6 +145,23 @@ were formulas — the direct cause of the unresolved-header backlog (Task #3).
 Use `sheets grid` whenever the question is "what IS this tab" rather than
 "what does it say"; it reads the same sheet natively through
 `spreadsheets.get(includeGridData)`, so the no-export rule is untouched.
+
+**Ingest uses `sheets snapshot`, never `sheets dump`.** A values-only read cannot
+tell a formula-derived cell from a measured one, so computed values would enter
+the store indistinguishable from observations. The 2026-09-12 audit found 8 of 11
+ingest specs reading tabs where derivation was pervasive for exactly that reason.
+`snapshot` also asserts its own coverage: it records the requested range, the
+returned bounds and the tab extent, and flags truncation — the loader refuses a
+truncated artifact. A 2026-09-12 sweep that read an 80-row window while reporting
+its counts as measurements understated the largest tab by nearly six times.
+
+## Gate harnesses
+
+`tools/tests/` holds the suite that must be green before anything lands (schema,
+loader contract, snapshot writer). See `tools/tests/README.md`. They read the
+authoritative `tools/schema/books.sql` rather than copied snapshots, and never
+pin a version literal — both mistakes previously let a suite go stale and
+silently stop gating.
 
 Native Sheets are **read directly through the Sheets API**, not exported to xlsx.
 The export path cost this project real diagnosis time — it injected ~1,000 blank
