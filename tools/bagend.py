@@ -19,6 +19,11 @@ Commands:
   ingest xlsx <path> <sheet> <table> [--skiprows N]
                                                Ingest one xlsx tab into private/books.db
   ingest csv <path> <table>                    Ingest a csv into private/books.db
+  load wave1 [--db PATH] [--create] [--structural] [--only SUBSTR]
+                                               Run the curation loader. --create applies
+                                               tools/schema/books.sql to a NEW store
+                                               (never private/books.db); --structural
+                                               uses the P2 snapshot-artifact reader.
   query "<sql>"                                Run SQL against private/books.db
 
 Conventions: see tools/README.md. Data stays in private/ (gitignored).
@@ -247,6 +252,50 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         conn.close()
 
 
+def cmd_load(args: argparse.Namespace) -> None:
+    """Run the wave-1 curation loader against a store.
+
+    `--create` builds a FRESH store by applying tools/schema/books.sql. It
+    refuses the live private/books.db outright and refuses an existing target,
+    because a copied/failed-over shadow silently defeats a reclassification
+    diff (the P2 review lesson). `--structural` selects the P2 artifact reader:
+    only specs that declare an `artifact` are loaded; the rest are listed.
+    """
+    import sqlite3
+    db = Path(args.db).resolve()
+    if args.create:
+        if db == config.DB_PATH.resolve():
+            sys.exit(f"refusing --create over the live store ({config.DB_PATH}); "
+                     f"the shadow must be a NEW file")
+        if db.exists():
+            sys.exit(f"refusing --create: {db} already exists — a shadow must be fresh "
+                     f"(remove it yourself and re-run)")
+        ddl = (Path(__file__).resolve().parent / "schema" / "books.sql").read_text()
+        con = sqlite3.connect(db)
+        con.executescript(ddl)
+        con.execute("PRAGMA foreign_keys=ON")
+        con.commit()
+        con.close()
+        print(f"created fresh store {_rel(db)} from tools/schema/books.sql")
+    if not db.exists():
+        sys.exit(f"not found: {db} (pass --create for a fresh store)")
+    con = sqlite3.connect(db)
+    con.execute("PRAGMA foreign_keys=ON")
+    try:
+        res = loader21.run_wave1(Path(args.curation), con,
+                                 only=args.only, structural=args.structural)
+    finally:
+        con.close()
+    for k in sorted(res):
+        v = res[k]
+        if isinstance(v, dict) and "rows" in v:
+            q = " QUARANTINED" if v.get("quarantined") else ""
+            print(f"  {k}: rows={v['rows']}{q}")
+        elif isinstance(v, list):
+            print(f"  {k}: {len(v)} spec(s)")
+    print(f"load wave1 -> {_rel(db)} ({'structural' if args.structural else 'legacy'} path)")
+
+
 def _connect_ro():
     """Open the store strictly read-only.
 
@@ -382,6 +431,19 @@ def main() -> None:
     p_q = sub.add_parser("query")
     p_q.add_argument("sql")
 
+    p_load = sub.add_parser("load", help="run the curation loader against a store")
+    load_sub = p_load.add_subparsers(dest="load_cmd", required=True)
+    ld_w1 = load_sub.add_parser("wave1")
+    ld_w1.add_argument("--curation", default="private/curation/v021_wave1.json")
+    ld_w1.add_argument("--db", default=str(config.DB_PATH))
+    ld_w1.add_argument("--create", action="store_true",
+                       help="apply tools/schema/books.sql to a NEW empty store first "
+                            "(refuses the live books.db and any existing target)")
+    ld_w1.add_argument("--structural", action="store_true",
+                       help="P2 snapshot-artifact reader; only specs declaring an "
+                            "`artifact` are loaded")
+    ld_w1.add_argument("--only", help="substring filter on the source alias")
+
     p_ex = sub.add_parser("export", help="emit local data bundles for the financial page")
     ex_sub = p_ex.add_subparsers(dest="export_cmd", required=True)
     ex_fin = ex_sub.add_parser("finpage")
@@ -390,7 +452,7 @@ def main() -> None:
 
     args = parser.parse_args()
     {"catalog": cmd_catalog, "fetch": cmd_fetch, "sheets": cmd_sheets,
-     "inspect": cmd_inspect,
+     "inspect": cmd_inspect, "load": cmd_load,
      "ingest": cmd_ingest, "query": cmd_query, "export": cmd_export}[args.cmd](args)
 
 

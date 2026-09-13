@@ -196,6 +196,10 @@ class Batch:
 
     def __init__(self, conn: sqlite3.Connection, note: str = ""):
         self.conn = conn
+        # v0.3 §7: a quarantined spec must leave a VISIBLE partial batch, not a
+        # silently-thinner complete one. load_structural_spec sets this on the
+        # quarantine path; __exit__ then records 'partial' instead of 'complete'.
+        self.partial = False
         cur = conn.execute(
             "INSERT INTO load_batch(started_at, status, tool_version, note) VALUES (?, 'failed', ?, ?)",
             (now(), TOOL_VERSION, note or None),
@@ -210,8 +214,8 @@ class Batch:
     def __exit__(self, exc_type, exc, tb):
         if exc_type is None:
             self.conn.execute(
-                "UPDATE load_batch SET status='complete', finished_at=? WHERE batch_id=?",
-                (now(), self.batch_id),
+                "UPDATE load_batch SET status=?, finished_at=? WHERE batch_id=?",
+                ("partial" if self.partial else "complete", now(), self.batch_id),
             )
             self.conn.execute("COMMIT")
         else:
@@ -660,11 +664,33 @@ def load_ssa_benefits(conn: sqlite3.Connection, batch: Batch, spec: dict) -> int
 
 # ---------------------------------------------------------------- pipeline
 
-def run_wave1(curation_path: Path, conn: sqlite3.Connection, only: str | None = None) -> dict:
+def run_wave1(curation_path: Path, conn: sqlite3.Connection, only: str | None = None,
+              structural: bool = False) -> dict:
+    """Run the wave-1 curation.
+
+    structural=False -> the legacy path (values-only CSV/xlsx per spec).
+    structural=True  -> the P2 structural reader: only specs that declare an
+    `artifact` are loaded; every other spec is skipped and LISTED, never
+    silently routed back to the CSV path (that would defeat the point).
+    """
     assert_schema(conn)
     cur = load_curation(curation_path)
-    acct_ids, metric_ids = ensure_dims(conn, cur.get("dim_accounts", []), cur.get("dim_metrics", []))
+    if structural:
+        specs = [s for s in cur["sources"] if s.get("artifact")
+                 and (not only or only in s["alias"])]
+        want_accts = {c["account"] for s in specs for c in s.get("columns", []) if c.get("account")}
+        want_metrics = {c["metric"] for s in specs for c in s.get("columns", []) if c.get("metric")}
+        accounts = [a for a in cur.get("dim_accounts", []) if a["code"] in want_accts]
+        metrics = [m for m in cur.get("dim_metrics", []) if m["name"] in want_metrics]
+    else:
+        accounts, metrics = cur.get("dim_accounts", []), cur.get("dim_metrics", [])
+    acct_ids, metric_ids = ensure_dims(conn, accounts, metrics)
+    allow = load_allow_list() if structural else None
     results = {}
+    if structural:
+        results["_skipped_no_artifact"] = [
+            s["alias"] for s in cur["sources"] if not s.get("artifact")
+            and (not only or only in s["alias"])]
     deferred = cur.get("deferred_sources", [])
     if deferred:
         results["_deferred"] = [{ "alias": s["alias"], "reason": s.get("reason", "deferred") } for s in deferred]
@@ -674,8 +700,13 @@ def run_wave1(curation_path: Path, conn: sqlite3.Connection, only: str | None = 
         key = spec["alias"]
         if only and only not in key:
             continue
+        if structural and not spec.get("artifact"):
+            continue
         family = spec["family"]
         with Batch(conn, note=f"{key}") as batch:
+            if structural:
+                results[key] = load_structural_spec(conn, batch, spec, allow, acct_ids, metric_ids)
+                continue
             superseded = 0
             if family == "state":
                 source_id = ensure_source(conn, spec)
@@ -1259,7 +1290,7 @@ def _words_by_row(words: list) -> list[list]:
 
 
 def _parse_chase(path: Path) -> tuple[str | None, list[dict]]:
-    """Chase Amazon card statement (suffix 5679). 3-column activity table:
+    """Chase Amazon card statement (account suffix redacted). 3-column activity table:
     Date (MM/DD, no year) | Description | signed $ Amount (unsigned=purchase,
     leading '-'=payment/credit). Section bands ('PAYMENTS AND OTHER CREDITS',
     'PURCHASE') are standalone rows. 'Order Number' sublines carry no
@@ -1433,3 +1464,900 @@ def load_card_statement(conn, batch, spec, acct_ids, path: Path) -> int:
         )
         n += 1
     return n
+
+
+# ================================================================ P2 structural reader
+# blueprint v0.3 §4 (classifier + legal-state table), §5 (store contract), §6
+# (identity), v0.2.1 §E4 (load-time shape assertions) + §D3 (allow-list join,
+# refuse-on-orphan, quarantine). Consumes the `sheets snapshot` artifact
+# (private/raw/sheets/<alias>__<tab>.json); the legacy CSV path stays for the
+# specs that have no artifact.
+#
+# Nothing in this section prints or returns owner values: source rows, column
+# letters, kinds and counts only.
+
+ALLOW_LIST_PATH = config.PRIVATE_DIR / "layouts" / "layouts.json"
+
+# §4 derivation_kind is a SET, stored NORMALISED per src_column.derivation_kind:
+# lower-case tokens, alphabetically sorted, comma-joined, no spaces.
+DERIVATION_TOKENS = frozenset({
+    "constant", "deterministic", "aggregate", "projection", "chain",
+    "copy", "declared_derived", "unresolved_ref", "unknown_formula",
+})
+AGGREGATE_FUNCS = frozenset({
+    "SUM", "SUMIF", "SUMIFS", "SUMPRODUCT", "AVERAGE", "AVERAGEIF",
+    "AVERAGEIFS", "COUNT", "COUNTA", "COUNTIF", "COUNTIFS", "MIN", "MAX",
+    "SUBTOTAL", "PRODUCT", "STDEV", "VAR",
+})
+PROJECTION_FUNCS = frozenset({
+    "VLOOKUP", "HLOOKUP", "LOOKUP", "XLOOKUP", "INDEX", "MATCH", "INDIRECT",
+    "OFFSET", "QUERY", "FILTER", "SORT", "SORTN", "UNIQUE", "CHOOSE",
+    "TRANSPOSE", "ARRAYFORMULA",
+})
+EXTERNAL_FUNCS = frozenset({
+    "IMPORTRANGE", "IMPORTDATA", "IMPORTXML", "IMPORTHTML", "IMPORTFEED",
+    "GOOGLEFINANCE", "GOOGLETRANSLATE", "IMAGE",
+})
+
+# A1 references. Quoted sheet names ('Inv Income') and bare sheet names are the
+# cross-sheet signal; a bare ref is same-tab. A negative lookbehind/lookahead
+# keeps function names (LOG10() ) and identifiers out.
+_REF_RE = re.compile(
+    r"(?<![A-Za-z0-9_.])"
+    r"(?:(?P<sheet>'(?:[^']|'')+'|[A-Za-z_][A-Za-z0-9_.]*)!)?"
+    r"(?P<col>\$?[A-Z]{1,3})(?P<row>\$?\d{1,7})(?!\()\b"
+)
+_FUNC_RE = re.compile(r"(?<![A-Za-z0-9_.])([A-Z][A-Z0-9_.]*)\s*\(")
+_PURE_REF_RE = re.compile(r"^\$?[A-Z]{1,3}\$?\d{1,7}$")
+_RANGE_REF_RE = re.compile(r"^\$?[A-Z]{1,3}\$?\d{1,7}:\$?[A-Z]{1,3}\$?\d{1,7}$")
+_A1_RE = re.compile(r"^([A-Z]{1,3})(\d{1,7})$")
+_STR_RE = re.compile(r'"(?:[^"]|"")*"')
+
+
+class Quarantine(Exception):
+    """A declared-shape mismatch (§E4) or an unparseable formula (§4): the spec is
+    quarantined and reported, never partially loaded under a shifted frame."""
+
+    def __init__(self, rule: str, detail: str = ""):
+        self.rule = rule
+        self.detail = detail
+        super().__init__(f"{rule}{': ' + detail if detail else ''}")
+
+
+def col_letters(i0: int) -> str:
+    """0-based column index -> A1 letters."""
+    s, n = "", i0 + 1
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def col_index(letters: str) -> int:
+    n = 0
+    for ch in letters.upper():
+        n = n * 26 + (ord(ch) - 64)
+    return n - 1
+
+
+def _split_a1(a1: str):
+    m = _A1_RE.match(a1 or "")
+    return (m.group(1), int(m.group(2))) if m else (None, None)
+
+
+def _label_key(s) -> str:
+    """Whitespace-collapsed, case-folded label/identity comparison."""
+    return norm_label(s).casefold()
+
+
+def _join_norm(s) -> str:
+    """Normalise an (alias, tab) join key: lower-case, alphanumerics only.
+
+    layouts.json spells the tab `Net-Worth Data`; a snapshot FILE is spelled
+    `stats__Net_Worth_Data.json`. A filename is NEVER identity (charter /
+    v0.2.1 E6) — this normalisation only makes the same declared pair match
+    across spellings; the artifact's embedded `tab` is the validated title.
+    """
+    return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+
+def load_allow_list(path: Path | None = None) -> dict:
+    return json.loads(Path(path or ALLOW_LIST_PATH).read_text())
+
+
+def allow_list_entry(allow: dict, alias: str, tab: str, where: str) -> tuple:
+    """Join the allow-list on (alias, tab). REFUSES on an orphan pair, naming it.
+
+    v0.2.1 §D3: no entry -> refuse to load. Tolerant on spelling only; the
+    artifact's embedded tab title (not the filename) is what is matched.
+    """
+    akey = _join_norm(alias)
+    src_key = next((k for k in allow.get("sources", {}) if _join_norm(k) == akey), None)
+    if src_key is None:
+        raise LoadError(
+            f"allow-list join refused at {where}: no layouts.json source entry for "
+            f"alias {alias!r} (normalised {akey!r})"
+        )
+    tabs = allow["sources"][src_key].get("tabs", {})
+    tkey = _join_norm(tab)
+    tab_key = next((k for k in tabs if _join_norm(k) == tkey), None)
+    if tab_key is None:
+        raise LoadError(
+            f"allow-list join refused at {where}: no layouts.json tab entry for "
+            f"({alias!r}, {tab!r}) under source {src_key!r}; have {sorted(tabs)}"
+        )
+    return src_key, tab_key, tabs[tab_key]
+
+
+class _Rect:
+    def __init__(self, header_row, group_row, sub_header_row, first_data_row,
+                 skip_rows, last_data_row, resolved, key_col, external_cols,
+                 derived_cols):
+        self.header_row = header_row
+        self.group_row = group_row
+        self.sub_header_row = sub_header_row
+        self.first_data_row = first_data_row
+        self.skip_rows = skip_rows
+        self.last_data_row = last_data_row
+        self.resolved = resolved          # label -> (col_index, header_rec, mapping|None)
+        self.key_col = key_col            # column index of the row key (date/year)
+        self.external_cols = external_cols
+        self.derived_cols = derived_cols
+
+    @property
+    def cols(self):
+        return sorted({ci for ci, _, _ in self.resolved.values()})
+
+
+def declared_rectangle(spec: dict, layout: dict, artifact: dict) -> _Rect:
+    """The ingest rectangle: (first_data_row .. last_data_row) x declared columns.
+
+    Layout semantics are AUTHORITATIVE from the allow-list (header_row,
+    group_row, sub_header_row, first_data_row, skip_rows, last_data_row,
+    key_column, external_links, derived_columns); the curation spec supplies the
+    expected column labels and their account/metric mapping. E5(b)'s per-column
+    allow-list fields do not exist in layouts.json yet, so the spec's `col` is
+    the expected label today; when the allow-list gains `expected_label` it wins.
+    """
+    idx = {c["a1"]: c for c in artifact.get("cells", [])}
+    header_row = layout.get("header_row") or spec.get("header_row")
+    if not header_row:
+        raise Quarantine("header_row-undeclared",
+                         f"{spec['alias']}: no header_row in allow-list or spec")
+    # header labels as declared by the sheet (the descriptor the artifact carries)
+    header: dict[str, list] = {}
+    for a1, rec in idx.items():
+        col, row = _split_a1(a1)
+        if row == header_row and rec.get("kind") != "blank":
+            header.setdefault(_label_key(rec.get("value")), []).append((col, rec))
+
+    declared: list[tuple] = []
+    for cm in spec.get("columns", []):
+        declared.append((cm.get("col"), cm))
+    for lbl in spec.get("skip_columns", []):
+        declared.append((lbl, None))
+
+    resolved: dict = {}
+    missing: list[str] = []
+    for label, mapping in declared:
+        if label is None:
+            continue
+        hits = header.get(_label_key(label), [])
+        if not hits:
+            missing.append(str(label))
+            continue
+        col, rec = hits[0]
+        resolved[label] = (col_index(col), rec, mapping)
+    if missing:
+        raise Quarantine("header-label-missing",
+                         f"{spec['alias']}: declared label(s) absent from header_row "
+                         f"{header_row}: {missing}")
+
+    first_data_row = layout.get("first_data_row") or spec.get("first_data_row") or (header_row + 1)
+    last_data_row = (layout.get("last_data_row") or spec.get("last_data_row")
+                     or (artifact.get("ingest_rectangle") or {}).get("last_row"))
+    if not last_data_row:
+        raise Quarantine("last_data_row-undeclared",
+                         f"{spec['alias']}: no last_data_row in allow-list and no artifact rectangle")
+    key_col = None
+    key_label = layout.get("key_column")
+    if key_label:
+        key_col = col_index(key_label) if len(str(key_label)) <= 3 and str(key_label).isalpha() else None
+    for label, (ci, _rec, mapping) in resolved.items():
+        if mapping and mapping.get("role") in ("as_of", "work_year"):
+            key_col = ci
+    if key_col is None:
+        raise Quarantine("key-column-undeclared", f"{spec['alias']}: no as_of/work_year column resolved")
+    external_cols = {str(k).upper() for k in (layout.get("external_links") or {})}
+    derived_cols = {str(c).upper() for c in (layout.get("derived_columns") or [])}
+    return _Rect(header_row, layout.get("group_row"), layout.get("sub_header_row"),
+                 int(first_data_row), list(layout.get("skip_rows") or spec.get("skip_rows") or []),
+                 int(last_data_row), resolved, key_col, external_cols, derived_cols)
+
+
+def assert_artifact_coverage(artifact: dict, rect: _Rect, where: str) -> None:
+    """v0.3 §3 hard rule + charter v1.0.2 'coverage is proven, never assumed'."""
+    if artifact.get("truncated") is not False:
+        raise LoadError(
+            f"{where}: artifact truncated={artifact.get('truncated')!r} — a truncated "
+            f"read is refused, never partially loaded (v0.3 §3)"
+        )
+    rb = artifact.get("returned_bounds") or {}
+    need_rows, need_cols = rect.last_data_row, max(rect.cols) + 1
+    if rb.get("rows", 0) < need_rows or rb.get("cols", 0) < need_cols:
+        raise LoadError(
+            f"{where}: artifact returned_bounds={rb} do not cover the declared "
+            f"rectangle (rows<={need_rows}, cols<={col_letters(need_cols - 1)}) — refusing"
+        )
+    wrect = artifact.get("ingest_rectangle") or {}
+    if wrect:
+        declared_cols = {col_letters(c) for c in rect.cols}
+        wcols = set(wrect.get("columns") or [])
+        if (rect.first_data_row < wrect.get("first_row", 1)
+                or rect.last_data_row > wrect.get("last_row", 0)
+                or not declared_cols <= wcols):
+            raise LoadError(
+                f"{where}: declared rectangle rows {rect.first_data_row}..{rect.last_data_row} "
+                f"cols {sorted(declared_cols)} is not inside the artifact's writer "
+                f"rectangle {wrect.get('first_row')}..{wrect.get('last_row')} {sorted(wcols)} — refusing"
+            )
+
+
+def assert_shape(artifact: dict, rect: _Rect, layout: dict, spec: dict) -> None:
+    """v0.2.1 §E4 load-time shape assertions. Mismatch -> Quarantine."""
+    idx = {c["a1"]: c for c in artifact.get("cells", [])}
+    problems: list[str] = []
+
+    # (a) expected label at each declared header cell
+    for label, (ci, rec, _m) in rect.resolved.items():
+        if rec.get("kind") == "blank":
+            problems.append(f"header label {label!r} is blank at {col_letters(ci)}{rect.header_row}")
+
+    # (b) declared group / sub-header tiers are labels, never formulas
+    for tier, tier_name in ((rect.group_row, "group_row"), (rect.sub_header_row, "sub_header_row")):
+        if tier is None:
+            continue
+        if not (rect.header_row < int(tier) < rect.first_data_row):
+            problems.append(f"{tier_name} r{tier} is not between header_row and first_data_row")
+        for ci in rect.cols:
+            rec = idx.get(f"{col_letters(ci)}{tier}")
+            if rec and rec.get("kind") in ("formula", "error", "spill"):
+                problems.append(f"{tier_name} {col_letters(ci)}{tier} carries a {rec['kind']}, not a label")
+
+    # (c) skip_rows shape: strictly inside the header band and NOT live key rows
+    for sr in rect.skip_rows:
+        sr = int(sr)
+        if not (rect.header_row < sr < rect.first_data_row):
+            problems.append(f"skip_rows r{sr} is not between header_row and first_data_row")
+        krec = idx.get(f"{col_letters(rect.key_col)}{sr}")
+        if krec and krec.get("kind") != "blank":
+            kv = krec.get("value")
+            if rect_key_live(kv, spec):
+                problems.append(f"skip_rows r{sr} carries a live key ({col_letters(rect.key_col)}{sr}) "
+                                f"— blank band / total row / label-only row expected")
+
+    # (d) first_data_row must begin on a live key row
+    kfirst = idx.get(f"{col_letters(rect.key_col)}{rect.first_data_row}")
+    if not (kfirst and kfirst.get("kind") != "blank" and rect_key_live(kfirst.get("value"), spec)):
+        problems.append(f"first_data_row r{rect.first_data_row} does not carry a live key")
+
+    # (e) declared merges present; a merge shadow is NEVER a blank (§4/E3)
+    declared_merges = layout.get("merges") or spec.get("merges") or []
+    have = set(artifact.get("merges") or [])
+    for m in declared_merges:
+        if m not in have:
+            problems.append(f"declared merge {m} absent from the artifact")
+    for a1, rec in idx.items():
+        if rec.get("merge_shadow_of") and rec.get("kind") == "blank":
+            problems.append(f"merge shadow {a1} is a blank — shadows inherit, never zero (§4/E3)")
+
+    if problems:
+        raise Quarantine("shape-mismatch", "; ".join(problems[:6])
+                         + (f" (+{len(problems) - 6} more)" if len(problems) > 6 else ""))
+
+
+def rect_key_live(value, spec: dict) -> bool:
+    """A row is live iff its key column parses as the declared key type."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return False
+    if spec.get("family") == "ssa_earnings" or any(
+            c.get("role") == "work_year" for c in spec.get("columns", [])):
+        try:
+            int(float(str(value).strip()))
+            return True
+        except (TypeError, ValueError):
+            return False
+    iso, _why = coerce_date(value, fmt=spec.get("date_format"))
+    return iso is not None
+
+
+def _mask_formula_shape(formula: str) -> str:
+    s = _STR_RE.sub('"S"', formula or "")
+    s = re.sub(r"\d+", "#", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def normalise_derivation_kinds(tokens) -> str | None:
+    toks = sorted({str(t).strip().lower() for t in tokens if t and str(t).strip()})
+    return ",".join(toks) if toks else None
+
+
+def _formula_refs(body: str):
+    b = _STR_RE.sub('""', body)
+    out = []
+    for m in _REF_RE.finditer(b):
+        if m.group("sheet") is not None:
+            out.append((m.group("sheet"), m.group("col").lstrip("$"), int(m.group("row").lstrip("$"))))
+        else:
+            out.append((None, m.group("col").lstrip("$"), int(m.group("row").lstrip("$"))))
+    return out
+
+
+class _CellCtx:
+    def __init__(self, idx: dict, external_cols: set, derived_cols: set, layout: dict, spec: dict):
+        self.idx = idx
+        self.external_cols = external_cols
+        self.derived_cols = derived_cols
+        self.layout = layout
+        self.spec = spec
+        self.depth = 0
+
+
+def _blank_record(at: str) -> dict:
+    # §3 + §4: an in-rectangle blank is a STATED zero, never an absence, and is
+    # emitted by the writer inside the rectangle (kind:"blank").
+    return {"origin": "entered", "presence": "zero_from_blank", "derivation": None,
+            "value_num": 0.0, "value_text": None, "error_type": None,
+            "copy_of": None, "formula_shape": None, "skip_reason": None, "at": at}
+
+
+def _error_record(at: str, token: str) -> dict:
+    return {"origin": "derived", "presence": "error", "derivation": None,
+            "value_num": None, "value_text": token or "ERROR", "error_type": token or "ERROR",
+            "copy_of": None, "formula_shape": None, "skip_reason": None, "at": at}
+
+
+def _literal_record(at: str, cell: dict, ctx: _CellCtx, ci: int) -> dict:
+    num, why = coerce_num(cell.get("value"))
+    if num is None:
+        # A non-numeric literal in a numeric fact column (the ratified 1996-98
+        # stray date cells, D14): refused loudly and skipped, never coerced.
+        return {"origin": None, "presence": None, "derivation": None,
+                "value_num": None, "value_text": None, "error_type": None,
+                "copy_of": None, "formula_shape": None,
+                "skip_reason": f"non-numeric-literal ({why})", "at": at}
+    declared_external = col_letters(ci) in ctx.external_cols
+    return {"origin": "external" if declared_external else "entered", "presence": "measured",
+            "derivation": "declared_derived" if col_letters(ci) in ctx.derived_cols else None,
+            "value_num": num, "value_text": None, "error_type": None,
+            "copy_of": None, "formula_shape": None, "skip_reason": None, "at": at}
+
+
+def classify_cell(cell: dict, ci: int, ctx: _CellCtx) -> dict:
+    """v0.3 §4 classifier for one artifact cell, applied AFTER merges are resolved
+    and AFTER the rectangle is established. Ordered, total, and refuses rather
+    than defaulting an unmapped state to `measured`."""
+    at = cell.get("a1") or "?"
+    kind = cell.get("kind")
+
+    # merge shadow: inherits the anchor wholesale and is NEVER a blank (§4/E3)
+    if cell.get("merge_shadow_of"):
+        anchor = ctx.idx.get(cell["merge_shadow_of"])
+        if anchor is None:
+            raise Quarantine("merge-shadow-anchor-missing", f"{at} -> {cell['merge_shadow_of']}")
+        if anchor.get("kind") == "blank":
+            raise Quarantine("merge-shadow-of-blank", f"{at} -> {cell['merge_shadow_of']}")
+        base = classify_cell(anchor, col_index(_split_a1(cell["merge_shadow_of"])[0] or "A"), ctx)
+        base = dict(base, at=at)
+        base["merge_shadow_of"] = cell["merge_shadow_of"]
+        return base
+
+    if kind == "blank":
+        return _blank_record(at)
+
+    if kind == "error":
+        return _error_record(at, cell.get("error_type"))
+
+    if kind == "spill":
+        sp = cell.get("spill_of")
+        if not sp:
+            # v0.3 §3/§4: an indeterminate spill extent refuses.
+            raise Quarantine("indeterminate-spill", f"{at} carries no spill_of")
+        anchor = ctx.idx.get(sp)
+        if anchor is None:
+            raise Quarantine("spill-anchor-missing", f"{at} -> {sp}")
+        base = dict(classify_cell(anchor, col_index(_split_a1(sp)[0] or "A"), ctx), at=at)
+        base["spill_of"] = sp
+        return base
+
+    if kind == "literal":
+        return _literal_record(at, cell, ctx, ci)
+
+    if kind == "formula":
+        return _classify_formula(at, cell, ci, ctx)
+
+    raise Quarantine("unclassified-kind", f"{at} kind={kind!r} (v0.3 §4 step 4)")
+
+
+def _classify_formula(at: str, cell: dict, ci: int, ctx: _CellCtx) -> dict:
+    if ctx.depth > 32:
+        raise Quarantine("formula-cycle", f"{at}: copy/chain resolution exceeded depth 32")
+    formula = cell.get("formula") or ""
+    body = formula[1:] if formula.startswith("=") else formula
+    shape = _mask_formula_shape(formula)
+    # The artifact carries the computed value alongside the formula (it is the
+    # ingest input). A value that will not coerce to a number is NOT silently
+    # zeroed: it is skipped with a logged reason unless it is an error token.
+    vnum, _vwhy = coerce_num(cell.get("value"))
+    stripped = body.strip()
+    if stripped in ('""', "''"):
+        # §4: formula -> empty string is NOT ingested, reason logged.
+        return {"origin": "derived", "presence": None, "derivation": None,
+                "value_num": None, "value_text": None, "error_type": None,
+                "copy_of": None, "formula_shape": shape,
+                "skip_reason": "formula-empty-string", "at": at}
+    if not stripped or stripped.startswith("#") and "(" not in stripped:
+        raise Quarantine("unparseable-formula", f"{at}: {shape}")
+
+    clean = _STR_RE.sub('""', body)
+    funcs = {m.group(1).upper() for m in _FUNC_RE.finditer(clean)}
+    refs = _formula_refs(body)
+    cross = [r for r in refs if r[0] is not None]
+    same = [(c, r) for (sheet, c, r) in refs if sheet is None]
+    external_col = col_letters(ci) in ctx.external_cols
+
+    def derived(base_tokens, origin, presence):
+        tokens = set(base_tokens)
+        if any(_ref_is_derived(c, r, ctx) for (c, r) in same):
+            tokens.add("chain")
+        if external_col:
+            origin = "external"
+        return {"origin": origin, "presence": presence,
+                "derivation": normalise_derivation_kinds(tokens),
+                "value_num": vnum, "value_text": None, "error_type": None,
+                "copy_of": None, "formula_shape": shape, "skip_reason": None, "at": at}
+
+    # cross-sheet / external wins over every formula shape (§4 precedence)
+    if cross or funcs & EXTERNAL_FUNCS:
+        tokens = {"chain"}
+        if funcs & PROJECTION_FUNCS:
+            tokens.add("projection")
+        if funcs & AGGREGATE_FUNCS:
+            tokens.add("aggregate")
+        if not (funcs - EXTERNAL_FUNCS):
+            tokens.add("deterministic")
+        return derived(tokens, "external", "estimated")
+
+    # formula whose operands are all literals -> entered / constant / measured
+    if not refs and not funcs:
+        if not re.fullmatch(r"[\d\s.+\-*/^%(),&<>=\"']+", body):
+            raise Quarantine("unparseable-formula", f"{at}: {shape}")
+        return {"origin": "entered", "presence": "measured", "derivation": "constant",
+                "value_num": vnum, "value_text": None, "error_type": None,
+                "copy_of": None, "formula_shape": shape, "skip_reason": None, "at": at}
+
+    # pure reference -> copy; a copy NEVER raises trust (inherits the source presence)
+    if _PURE_REF_RE.match(stripped):
+        ref = stripped.replace("$", "")
+        src = ctx.idx.get(ref)
+        ctx.depth += 1
+        try:
+            src_cls = classify_cell(src, ci, ctx) if src is not None else None
+        finally:
+            ctx.depth -= 1
+        if src_cls is None:
+            tokens = {"copy", "unresolved_ref"}
+            return derived(tokens, "copy", "estimated")
+        if src_cls.get("skip_reason"):
+            return {"origin": "copy", "presence": "estimated", "derivation": "copy",
+                    "value_num": None, "value_text": None, "error_type": None,
+                    "copy_of": ref, "formula_shape": shape,
+                    "skip_reason": f"copy-of-{src_cls['skip_reason']}", "at": at}
+        tokens = {"copy"}
+        if "chain" in (src_cls.get("derivation") or ""):
+            tokens.add("chain")
+        return {"origin": "external" if external_col else "copy",
+                "presence": src_cls["presence"], "derivation": normalise_derivation_kinds(tokens),
+                "value_num": vnum, "value_text": None, "error_type": None,
+                "copy_of": ref, "formula_shape": shape, "skip_reason": None, "at": at}
+
+    # a bare range reference is a projection over a span, not a copy
+    if _RANGE_REF_RE.match(stripped):
+        return derived({"projection"}, "derived", "estimated")
+
+    if funcs & PROJECTION_FUNCS:
+        return derived({"projection"}, "derived", "estimated")
+    if funcs & AGGREGATE_FUNCS:
+        return derived({"aggregate"}, "derived", "estimated")
+    # arithmetic over cells: deterministic, escalated to estimated (never measured)
+    if refs or re.fullmatch(r"[\s\d.+\-*/^%(),&<>=A-Za-z$'\"]+", body):
+        return derived({"deterministic"}, "derived", "estimated")
+    raise Quarantine("unparseable-formula", f"{at}: {shape}")
+
+
+def _ref_is_derived(letters: str, row: int, ctx: _CellCtx) -> bool:
+    rec = ctx.idx.get(f"{letters}{row}")
+    return bool(rec) and rec.get("kind") in ("formula", "error", "spill")
+
+
+def _read_artifact(spec: dict) -> dict:
+    path = Path(spec["artifact"])
+    if not path.exists():
+        raise LoadError(f"{spec['alias']}: artifact not found at {path} — fetch it with "
+                        f"`bagend.py sheets snapshot` before loading")
+    artifact = json.loads(path.read_text())
+    if artifact.get("artifact_version") != 1:
+        raise LoadError(f"{spec['alias']}: artifact_version={artifact.get('artifact_version')!r} "
+                        f"is not the supported v1 (§3)")
+    return artifact
+
+
+def _validate_artifact_identity(spec: dict, artifact: dict) -> None:
+    """v0.3 §6: (drive_id, sheet_id) is identity; tab/alias are validated metadata."""
+    if spec.get("drive_id") and artifact.get("drive_id") != spec["drive_id"]:
+        raise LoadError(f"{spec['alias']}: artifact drive_id does not match the curation spec "
+                        f"(§6 identity) — refusing")
+    if artifact.get("tab") and _label_key(artifact["tab"]) != _label_key(spec.get("tab")):
+        raise LoadError(f"{spec['alias']}: artifact tab {artifact['tab']!r} != declared "
+                        f"{spec.get('tab')!r} — refusing (a filename is never identity)")
+
+
+def _quarantine(conn, batch: Batch, spec: dict, artifact: dict | None, q: Quarantine) -> None:
+    """v0.3 §7: quarantine must be VISIBLE — coverage_calendar not-loaded rows plus
+    a partial batch. A silent refusal would just make the store look complete."""
+    batch.partial = True
+    conn.execute("UPDATE load_batch SET status='partial' WHERE batch_id=?", (batch.batch_id,))
+    periods: list[str] = []
+    if artifact:
+        idx = {c["a1"]: c for c in artifact.get("cells", [])}
+        try:
+            rect = declared_rectangle(spec, {"header_row": spec.get("header_row")}, artifact)
+            key_ci = rect.key_col
+        except Exception:
+            key_ci = 0
+        for a1, rec in idx.items():
+            col, row = _split_a1(a1)
+            if col_index(col) != key_ci or rec.get("kind") == "blank":
+                continue
+            v = rec.get("value")
+            if isinstance(v, str) and re.match(r"^\d{4}", v):
+                periods.append(v[:4])
+            elif isinstance(v, (int, float)) and 1900 <= v <= 2100:
+                periods.append(str(int(v)))
+    if not periods:
+        periods = [str(datetime.now(timezone.utc).year)]
+    for p in sorted(set(periods)):
+        coverage(conn, spec["alias"], spec["tab"], {p: "not-loaded"},
+                 note=f"quarantined: {q.rule}")
+    conn.execute("UPDATE load_batch SET note=COALESCE(note,'')||' | QUARANTINE '||? WHERE batch_id=?",
+                 (str(q)[:300], batch.batch_id))
+    print(f"  !! QUARANTINED {spec['alias']}: {q.rule} — {q.detail}", flush=True)
+
+
+def _write_src_columns(conn, source_id: int, spec: dict, rect: _Rect, col_facts: dict,
+                       metric_ids: dict, acct_ids: dict) -> int:
+    """Populate src_column (never written before v0.2.5): column-grain derivation,
+    per blueprint §2/§5. Replaces the tab's rows so a re-load is idempotent."""
+    row = conn.execute("SELECT tab_id FROM src_tab WHERE source_id=? AND tab=? AND block=''",
+                       (source_id, spec["tab"])).fetchone()
+    if row is None:
+        raise LoadError(f"{spec['alias']}: src_tab row missing for tab {spec['tab']!r}")
+    tab_id = row[0]
+    conn.execute("DELETE FROM src_column WHERE tab_id=?", (tab_id,))
+    n = 0
+    by_label = {label: tup for label, tup in rect.resolved.items()}
+    for label, (ci, header_rec, mapping) in sorted(by_label.items(), key=lambda kv: kv[1][0]):
+        facts = col_facts.get(ci, {})
+        origin = facts.get("origin")
+        if mapping and mapping.get("role") in ("as_of", "work_year"):
+            role = "key"
+        elif origin == "external" or col_letters(ci) in rect.external_cols:
+            role = "external"
+        elif origin == "copy":
+            role = "copy"
+        elif origin == "derived":
+            role = "derived"
+        elif mapping is None:
+            role = "scratch"
+        else:
+            role = "value"
+        account_id = acct_ids.get(mapping.get("account")) if mapping else None
+        metric_id = metric_ids.get(mapping.get("metric")) if mapping else None
+        unit = None
+        if metric_id is not None:
+            mrow = conn.execute("SELECT unit FROM dim_metric WHERE metric_id=?", (metric_id,)).fetchone()
+            unit = mrow[0] if mrow else None
+        conn.execute(
+            """INSERT INTO src_column(tab_id, col_index, header_text, header_occurrence,
+               account_id, metric_id, unit, origin, derivation_kind, formula_shape, copy_of, role)
+               VALUES (?,?,?,1,?,?,?,?,?,?,?,?)""",
+            (tab_id, ci, norm_label(header_rec.get("value")), account_id, metric_id, unit,
+             facts.get("origin"), normalise_derivation_kinds(facts.get("tokens") or []),
+             facts.get("formula_shape"), facts.get("copy_of"), role),
+        )
+        n += 1
+    return n
+
+
+def _apply_cell_facts(col_facts: dict, ci: int, cls: dict) -> None:
+    f = col_facts.setdefault(ci, {"tokens": set(), "origins": set(), "shapes": set(),
+                                  "copy_of": None, "formula_shape": None})
+    if cls.get("skip_reason"):
+        return
+    if cls.get("origin"):
+        f["origins"].add(cls["origin"])
+    if cls.get("derivation"):
+        f["tokens"].update(str(cls["derivation"]).split(","))
+    if cls.get("formula_shape"):
+        f["shapes"].add(cls["formula_shape"])
+    if cls.get("copy_of") and not f["copy_of"]:
+        f["copy_of"] = cls["copy_of"]
+
+
+def _resolve_col_origin(col_facts: dict) -> None:
+    precedence = ("external", "derived", "copy", "entered")
+    for f in col_facts.values():
+        for o in precedence:
+            if o in f["origins"]:
+                f["origin"] = o
+                break
+        else:
+            f["origin"] = None
+        if f["shapes"]:
+            f["formula_shape"] = " | ".join(sorted(f["shapes"]))
+        else:
+            f["formula_shape"] = None
+
+
+def _live_rows(artifact: dict, rect: _Rect, spec: dict):
+    """Yield (row_number, key_value) for live rows of the declared rectangle."""
+    idx = {c["a1"]: c for c in artifact.get("cells", [])}
+    for r in range(rect.first_data_row, rect.last_data_row + 1):
+        rec = idx.get(f"{col_letters(rect.key_col)}{r}")
+        if rec is None or rec.get("kind") == "blank":
+            continue
+        yield r, rec.get("value")
+
+
+def _load_state_structural(conn, batch: Batch, spec: dict, source_id: int, layout: dict,
+                           artifact: dict, rect: _Rect, acct_ids, metric_ids) -> int:
+    idx = {c["a1"]: c for c in artifact.get("cells", [])}
+    ctx = _CellCtx(idx, rect.external_cols, rect.derived_cols, layout, spec)
+    col_facts: dict = {}
+    total_label = next((lbl for lbl in rect.resolved
+                        if _label_key(lbl) == _label_key("Total Assets")), None)
+    derived_cols = [m for m in spec["columns"] if m.get("mode") == "derive_from_delta"]
+    seq_buf: dict = {}
+    issues: list[str] = []
+    row_totals: dict = {}
+    n = 0
+    n_skipped = 0
+    for rowno, keyv in _live_rows(artifact, rect, spec):
+        as_of, d_reason = coerce_date(keyv, fmt=spec.get("date_format"))
+        if as_of and spec.get("month_end") and len(as_of) == 7:
+            import calendar as _cal
+            y, m = map(int, as_of.split("-"))
+            as_of = f"{y:04d}-{m:02d}-{_cal.monthrange(y, m)[1]:02d}"
+        if as_of is None:
+            issues.append(f"row {rowno}: key {d_reason}")
+            continue
+        row_sum = 0.0
+        for label, (ci, _hdr, mapping) in rect.resolved.items():
+            if mapping is not None and mapping.get("role") == "as_of":
+                continue   # row addressing, never a fact row (§4 key column)
+            # Every DECLARED column is classified (so src_column carries the
+            # column-grain derivation of skip_columns too); only mapped columns
+            # become fact rows.
+            derive_mode = bool(mapping and mapping.get("mode") == "derive_from_delta")
+            cell = idx.get(f"{col_letters(ci)}{rowno}") or {"a1": f"{col_letters(ci)}{rowno}",
+                                                           "kind": "blank"}
+            if derive_mode:
+                # component reconstructed by difference below: record it, never
+                # read the column's placeholder cells as facts (D14).
+                col_facts.setdefault(ci, {"tokens": {"deterministic"}, "origins": {"derived"},
+                                          "shapes": set(), "copy_of": None,
+                                          "formula_shape": None})
+                if mapping is None:
+                    continue
+            else:
+                cls = classify_cell(cell, ci, ctx)
+                _apply_cell_facts(col_facts, ci, cls)
+            if mapping is None:
+                continue   # declared skip column: classified, not ingested
+            if not derive_mode:
+                if cls.get("skip_reason"):
+                    issues.append(f"row {rowno} col {col_letters(ci)}: {cls['skip_reason']}")
+                    continue
+            if derive_mode:
+                continue
+            require_legal_pair(cls["origin"], cls["presence"],
+                               f"row {rowno} col {col_letters(ci)}")
+            val = cls["value_num"]
+            if val is None and cls["value_text"] is None:
+                issues.append(f"row {rowno} col {col_letters(ci)}: no value (skipped)")
+                continue
+            acct = acct_ids[mapping["account"]]
+            met = metric_ids[mapping["metric"]]
+            grain = mapping.get("grain", "month-end")
+            key = (acct, met, as_of)
+            seq = seq_buf.get(key, 0) + 1
+            seq_buf[key] = seq
+            nk = f"{source_id}|{acct}|{met}|{as_of}|{seq}"
+            h = state_content_hash(acct, met, as_of, seq, val, cls["presence"], cls["origin"])
+            if conn.execute("SELECT 1 FROM fact_state WHERE content_hash=?", (h,)).fetchone():
+                n_skipped += 1
+                continue
+            for old in conn.execute(
+                    "SELECT natural_key FROM fact_state WHERE natural_key=? AND batch_id<>? "
+                    "AND superseded_by_batch_id IS NULL", (nk, batch.batch_id)).fetchall():
+                conn.execute("UPDATE fact_state SET superseded_by_batch_id=? WHERE natural_key=?",
+                             (batch.batch_id, old[0]))
+            conn.execute(
+                """INSERT INTO fact_state(natural_key, account_id, metric_id, as_of, seq_in_date,
+                   sheet_row_number, value_num, value_text, presence, origin, error_type,
+                   period_grain, grain_detail, content_hash, source_id, batch_id, ingested_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (nk, acct, met, as_of, seq, rowno, val, cls["value_text"], cls["presence"],
+                 cls["origin"], cls["error_type"], grain, spec.get("grain"), h,
+                 source_id, batch.batch_id, now()),
+            )
+            if met == metric_ids.get("TOTAL_ASSETS") and val is not None:
+                row_sum += val
+            n += 1
+        if total_label is not None:
+            trec = idx.get(f"{col_letters(rect.resolved[total_label][0])}{rowno}")
+            src_total, _ = coerce_num(trec.get("value")) if trec else (None, None)
+            if src_total is not None:
+                row_totals[as_of] = (row_sum, src_total)
+    # closed-account component derived by difference (unchanged semantics)
+    for mapping in derived_cols:
+        acct = acct_ids[mapping["account"]]
+        met = metric_ids[mapping["metric"]]
+        grain = mapping.get("grain", "month-end")
+        d_presence, d_origin = "estimated", "derived"
+        require_legal_pair(d_origin, d_presence, f"derived column {mapping['col']!r}")
+        for as_of, (measured_sum, src_total) in sorted(row_totals.items()):
+            delta = src_total - measured_sum
+            if abs(delta) <= 0.01:
+                continue
+            seq = seq_buf.get((acct, met, as_of), 0) + 1
+            seq_buf[(acct, met, as_of)] = seq
+            nk = f"{source_id}|{acct}|{met}|{as_of}|{seq}"
+            h = state_content_hash(acct, met, as_of, seq, delta, d_presence, d_origin)
+            conn.execute(
+                """INSERT INTO fact_state(natural_key, account_id, metric_id, as_of, seq_in_date,
+                   sheet_row_number, value_num, value_text, presence, origin, period_grain,
+                   grain_detail, verify_note, content_hash, source_id, batch_id, ingested_at)
+                   VALUES (?,?,?,?,?,NULL,?,NULL,?,?,?,?,?,?,?,?,?)""",
+                (nk, acct, met, as_of, seq, delta, d_presence, d_origin, grain, spec.get("grain"),
+                 mapping.get("note"), h, source_id, batch.batch_id, now()),
+            )
+            n += 1
+    _resolve_col_origin(col_facts)
+    n_cols = _write_src_columns(conn, source_id, spec, rect, col_facts, metric_ids, acct_ids)
+    if n_skipped:
+        issues.append(f"{n_skipped} rows identical to existing current rows — skipped")
+    if issues:
+        note = "; ".join(issues[:8]) + (f" (+{len(issues) - 8} more)" if len(issues) > 8 else "")
+        conn.execute("UPDATE load_batch SET note=COALESCE(note,'')||' | '||? WHERE batch_id=?",
+                     (note, batch.batch_id))
+    return n, n_cols
+
+
+def _row_presence_origin(cells: list) -> tuple:
+    """Row-grain (presence, origin) for a family whose row carries several cells.
+
+    ss_earnings_annual carries one presence per row but two value columns. Rule:
+    an error anywhere dominates; else a derived/estimated cell; else any measured
+    cell keeps the row measurable (a blank companion never downgrades it); a row
+    that is blank across every value column is zero_from_blank. origin is the
+    most-derived cell's origin (external > derived > copy > entered).
+    """
+    order = ("external", "derived", "copy", "constant_formula", "entered")
+    presences = [c["presence"] for c in cells if c.get("presence")]
+    origins = [c["origin"] for c in cells if c.get("origin")]
+    if "error" in presences:
+        presence = "error"
+    elif "estimated" in presences:
+        presence = "estimated"
+    elif "measured" in presences:
+        presence = "measured"
+    elif "zero_from_blank" in presences:
+        presence = "zero_from_blank"
+    else:
+        presence = "measured"
+    origin = next((o for o in order if o in origins), "entered")
+    return presence, origin
+
+
+def _load_ssa_earnings_structural(conn, batch: Batch, spec: dict, source_id: int, layout: dict,
+                                  artifact: dict, rect: _Rect, acct_ids, metric_ids) -> int:
+    idx = {c["a1"]: c for c in artifact.get("cells", [])}
+    ctx = _CellCtx(idx, rect.external_cols, rect.derived_cols, layout, spec)
+    col_facts: dict = {}
+    roles = {}
+    for label, (ci, _hdr, mapping) in rect.resolved.items():
+        if mapping:
+            roles[mapping.get("role")] = ci
+    n = 0
+    years = set()
+    issues: list[str] = []
+    for rowno, keyv in _live_rows(artifact, rect, spec):
+        try:
+            work_year = int(float(str(keyv).strip()))
+        except (TypeError, ValueError):
+            issues.append(f"row {rowno}: work_year unparseable")
+            continue
+        cells = []
+        values: dict = {}
+        for role in ("ss_taxed", "medicare_taxed"):
+            ci = roles.get(role)
+            if ci is None:
+                continue
+            cell = idx.get(f"{col_letters(ci)}{rowno}") or {"a1": f"{col_letters(ci)}{rowno}",
+                                                           "kind": "blank"}
+            cls = classify_cell(cell, ci, ctx)
+            _apply_cell_facts(col_facts, ci, cls)
+            if cls.get("skip_reason"):
+                issues.append(f"row {rowno} col {col_letters(ci)}: {cls['skip_reason']}")
+                continue
+            cells.append(cls)
+            values[role] = cls
+        presence, origin = _row_presence_origin(cells) if cells else ("zero_from_blank", "entered")
+        error_type = next((c["error_type"] for c in cells if c.get("error_type")), None)
+        require_legal_pair(origin, presence, f"ss_earnings row {rowno}")
+        ss = values.get("ss_taxed", {}).get("value_num")
+        med = values.get("medicare_taxed", {}).get("value_num")
+        raw_ss = values.get("ss_taxed", {}).get("value_text")
+        nk = f"{source_id}|{work_year}"
+        conn.execute(
+            """INSERT INTO ss_earnings_annual(natural_key, work_year, ss_taxed, medicare_taxed,
+               presence, origin, error_type, needs_verify, source_id, batch_id, ingested_at)
+               VALUES (?,?,?,?,?,?,?,0,?,?,?)""",
+            (nk, work_year, ss if ss is not None else raw_ss, med, presence, origin,
+             error_type, source_id, batch.batch_id, now()),
+        )
+        years.add(work_year)
+        n += 1
+    _resolve_col_origin(col_facts)
+    _write_src_columns(conn, source_id, spec, rect, col_facts, metric_ids, acct_ids)
+    coverage(conn, spec["alias"], spec["tab"],
+             {str(y): ("loaded" if y in years else "absent-in-source") for y in range(1996, 2026)},
+             note="structural read; non-numeric work-year rows refused loudly")
+    if issues:
+        note = "; ".join(issues[:8]) + (f" (+{len(issues) - 8} more)" if len(issues) > 8 else "")
+        conn.execute("UPDATE load_batch SET note=COALESCE(note,'')||' | '||? WHERE batch_id=?",
+                     (note, batch.batch_id))
+    return n
+
+
+def load_structural_spec(conn, batch: Batch, spec: dict, allow: dict, acct_ids, metric_ids) -> dict:
+    """P2 entry: one curation spec -> the store via its snapshot artifact."""
+    source_id = ensure_source(conn, spec)
+    ensure_sentinels(conn, source_id)
+    artifact = None
+    try:
+        artifact = _read_artifact(spec)
+        _validate_artifact_identity(spec, artifact)
+        alias_base = spec["alias"].split(":", 1)[0]
+        _src_key, _tab_key, layout = allow_list_entry(
+            allow, alias_base, artifact.get("tab") or spec.get("tab"), spec["alias"])
+        rect = declared_rectangle(spec, layout, artifact)
+        assert_artifact_coverage(artifact, rect, spec["alias"])
+        assert_shape(artifact, rect, layout, spec)
+        if spec["family"] == "state":
+            n, n_cols = _load_state_structural(conn, batch, spec, source_id, layout,
+                                               artifact, rect, acct_ids, metric_ids)
+        elif spec["family"] == "ssa_earnings":
+            n = _load_ssa_earnings_structural(conn, batch, spec, source_id, layout,
+                                              artifact, rect, acct_ids, metric_ids)
+            n_cols = None
+        else:
+            raise LoadError(f"{spec['alias']}: structural reader has no implementation for "
+                            f"family {spec['family']!r} (P2 first wave is stats + ss_earning)")
+        return {"rows": n, "quarantined": False, "src_columns": n_cols,
+                "artifact_sha256": artifact.get("artifact_sha256"),
+                "artifact": str(spec["artifact"])}
+    except Quarantine as q:
+        _quarantine(conn, batch, spec, artifact, q)
+        return {"rows": 0, "quarantined": True, "rule": q.rule, "detail": q.detail}

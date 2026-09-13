@@ -11,11 +11,13 @@ The verification suite that must be green before anything lands in `tools/` or
 | `schema_parity.py` | v0.2.5 DDL: new columns + CHECKs, presence vocabulary, the **two zeros hashing differently**, error rows via `value_text`, the 24-combination SQL-vs-loader legal-pair equality, rebuilt-vs-fresh parity | 8 |
 | `loader_smoke.py` | loader: origin/presence resolution, hash contents, illegal-pair refusal, column-grain precedence | prints `LOADER SMOKE OK` |
 | `snapshot_tests.py` | P1 structural snapshot: bounds/truncation, kinds, formats, spill, notes, date-typing hazard | 95 |
+| `structural_loader_tests.py` | P2 structural reader: §4 classifier totality, merge/spill rules, allow-list join, coverage, E4 shape quarantine, src_column, legal pairs | 42 |
 
 ```bash
-for t in v02_tests v02_1_tests v021_loader_tests schema_parity loader_smoke snapshot_tests; do
+for t in v02_tests v02_1_tests v021_loader_tests schema_parity loader_smoke snapshot_tests structural_loader_tests; do
   python3 tools/tests/$t.py || echo "FAILED: $t"
 done
+python3 tools/tests/shadow_diff.py   # P2 shadow-vs-live (needs private/books-shadow.db; SKIPs if absent)
 bash tools/check_hygiene.sh
 ```
 

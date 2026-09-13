@@ -10,13 +10,13 @@ cd "$(dirname "$0")/.."
 BLOCK=private/hygiene-blocklist.txt
 status=0
 
-echo "[1/3] digit runs in prose/data (*.md/*.json/*.tsv/*.sql; code constants exempt)…"
+echo "[1/4] digit runs in prose/data (*.md/*.json/*.tsv/*.sql; code constants exempt)…"
 hits=$(grep -rnI --include="*.md" --include="*.json" --include="*.tsv" --include="*.sql" -E "[0-9]{5,}" tools docs AGENTS.md README.md 2>/dev/null \
    | grep -vE ":[0-9]+:(19|20)[0-9]{2}" | grep -v "check_hygiene.sh" || true)
 if [ -n "$hits" ]; then echo "  ✗ digit runs found:"; echo "$hits" | sed 's/^/      /'; status=1
 else echo "  ✓ clean"; fi
 
-echo "[2/3] blocklisted names in committed prose/data (code literals exempt)…"
+echo "[2/4] blocklisted names in committed prose/data (code literals exempt)…"
 [ -f "$BLOCK" ] || { echo "  ! no blocklist at $BLOCK (skipping)"; exit $status; }
 while IFS= read -r term; do
   [ -z "$term" ] && continue
@@ -43,7 +43,7 @@ done < "$BLOCK"
 #     institution names are functional identifiers (parser keys such as
 #     `if parser == "chase"`, statement-format probes). Renaming those is a
 #     behaviour change and does not belong in a hygiene fix.
-echo "[3/3] .py files: account-shaped digit runs (8+) and blocklist names…"
+echo "[3/4] .py files: account-shaped digit runs (8+) and blocklist names…"
 py_digits=$(grep -rnE --include="*.py" "[0-9]{8,}" tools 2>/dev/null \
    | grep -vE "[0-9a-fA-F]{24,}|0x[0-9a-fA-F]+|check_hygiene.sh" || true)
 if [ -n "$py_digits" ]; then
@@ -69,5 +69,23 @@ if [ -f "$BLOCK" ]; then
   [ $warn -eq 1 ] && echo "      (operational identifiers — review, but do not rename blindly)"
   [ $status -eq 0 ] && echo "  ✓ no blocklisted names in test fixtures"
 fi
+
+# ------------------------------------------------- account-fragment patterns
+# Added 2026-09-12 after the owner flagged a card "suffix 5679" sitting in a
+# loader docstring. That class -- a partial account identifier in prose -- is
+# below every digit threshold above (four digits), so no numeric rule could ever
+# catch it. These patterns are anchored on the *phrasing* that introduces a
+# fragment, which is why the rule is narrow: measured against the whole tree it
+# flags exactly one line, the one that prompted it.
+#   x{2,}[0-9]{4,} is deliberately lowercase-x only: '*{2,}' collides with
+#   markdown bold (every '**2026-...' heading) and produced ~40 false positives.
+echo "[4/4] account-fragment phrasing (suffix/ending-in/last-4/masked/acct #)…"
+frag=$(grep -rniE --include="*.py" --include="*.md" --include="*.json" --include="*.tsv" --include="*.sql" --include="*.html" \
+  "(suffix|ending in)[^a-z0-9]{0,3}[0-9]{2,}|last[ -]?4[^a-z0-9]{0,3}[0-9]{2,}|x{2,}[0-9]{4,}|(acct|account)[^a-z0-9]{0,3}#[^a-z0-9]{0,3}[0-9]" \
+  tools docs AGENTS.md README.md 2>/dev/null | grep -v check_hygiene.sh || true)
+if [ -n "$frag" ]; then
+  echo "  ✗ account-fragment-looking text (personal data — remove it):"
+  echo "$frag" | sed 's/^/      /'; status=1
+else echo "  ✓ clean"; fi
 
 exit $status
