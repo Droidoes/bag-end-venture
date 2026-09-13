@@ -16,6 +16,14 @@ A blank numeric cell **inside an existing live row means 0**, recorded as
 row and **no row is written**. The default is `zero`; the exception is declared
 per column, never inferred.
 
+**Owner confirmation (2026-09-12, on `Stats / Net-Worth Data`):** columns
+**L (`Deposit`)**, **R (`IRS Income`)** and **S (`Total IRS Income`)** are *one
+class* — a data series meaningful only on December rows. Blank cells in those
+three columns on any other row are **N/A**. That is the owner-supplied fact this
+decision rests on; the loader-side mechanism used to express it is the COS's
+call, not the owner's.
+
+
 ## Context
 
 The 2026-09-12 structural load of the first wave (`stats / Net-Worth Data`,
