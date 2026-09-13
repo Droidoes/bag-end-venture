@@ -12,10 +12,11 @@ The verification suite that must be green before anything lands in `tools/` or
 | `loader_smoke.py` | loader: origin/presence resolution, hash contents, illegal-pair refusal, column-grain precedence | prints `LOADER SMOKE OK` |
 | `snapshot_tests.py` | P1 structural snapshot: bounds/truncation, kinds, formats, spill, notes, date-typing hazard | 95 |
 | `structural_loader_tests.py` | P2 structural reader: §4 classifier totality, merge/spill rules, allow-list join, coverage, E4 shape quarantine, src_column, legal pairs | 42 |
-| `blank_semantics_tests.py` | DM-2026-01 blank semantics: per-column `blank_means` (`zero` default / `not_applicable` writes no row), the per-column zero report, per-column `series_start` (a blank before the declared start contributes nothing; the **anchored-blank guard stays non-vacuous at/after it** — negative test), the report-only `SERIES SHAPE` detector, and the `expected=0` escape hatch | 42 |
+| `blank_semantics_tests.py` | DM-2026-01 blank semantics: per-column `blank_means` (`zero` default / `not_applicable` writes no row), the per-column zero report, per-column `series_start`, `series_anchor_month` arming (declaration-driven — the `Deposit` shape arms with no grain on the mapping), the **anchored-blank guard staying non-vacuous at/after the start** (negative test), the report-only `SERIES SHAPE` detector, the `expected=0` escape hatch | 57 |
+| `view_contract_tests.py` | Slice B read surface: `v_state_current` exposes `presence`/`origin`/`error_type`/`derivation_kind`; the five-class composition partition (`copy` > `error` > `presence`) sums to the row count; **additive totals exclude `copy` and `error`**; a `copy` is never summed with its source; `n_error` means `presence='error'`, not a null value | 122 |
 
 ```bash
-for t in v02_tests v02_1_tests v021_loader_tests schema_parity loader_smoke snapshot_tests structural_loader_tests blank_semantics_tests; do
+for t in v02_tests v02_1_tests v021_loader_tests schema_parity loader_smoke snapshot_tests structural_loader_tests blank_semantics_tests view_contract_tests; do
   python3 tools/tests/$t.py || echo "FAILED: $t"
 done
 python3 tools/tests/shadow_diff.py   # P2 shadow-vs-live (needs private/books-shadow.db; SKIPs if absent)

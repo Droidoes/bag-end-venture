@@ -22,6 +22,17 @@
 -- one-of value CHECK is deliberately UNCHANGED; value_text carrying the token
 -- satisfies it.
 --
+-- SLICE B (view contract, blueprint v0.3 section 5) — APPLIED TO THIS SCRIPT WITH NO
+-- VERSION BUMP, on instruction; the COS sequences the bump once the concurrent leg
+-- lands. The READ SURFACE is now honest about presence and origin: v_state_current
+-- exposes presence/origin/error_type plus the column-grain derivation_kind
+-- attributed from src_column; v_net_worth gained a composition breakdown and its
+-- additive total excludes copy and error; v_state_conflicts and v_holding_current
+-- expose presence/origin/error_type. A store built from an earlier copy of this file
+-- therefore carries DIFFERENT view DDL: it must be rebuilt (or have its views
+-- recreated) before it agrees with this script. Tables and CHECKs are UNTOUCHED —
+-- this is a view-only change. See .scratch/sliceb/report.md.
+--
 -- APPLICATION RULES
 --   * Apply to a FRESH store only. No IF NOT EXISTS anywhere: re-application fails
 --     loudly by design. Migration path is rebuild-from-Drive, never ALTER-in-place
@@ -242,8 +253,12 @@ CREATE TABLE fact_state (
   CHECK ((value_num IS NULL) <> (value_text IS NULL)),
   -- LEGAL (origin, presence) PAIRS — blueprint §4, encoded as an explicit list of
   -- expanded conjuncts (SQLite forbids row-value IN inside a CHECK). `key` carries
-  -- NO pair: a key column is row addressing, never a fact row. (external,'error')
-  -- is absent: §4 maps errored formulas to origin='derived'. The same list lives in
+  -- NO pair: a key column is row addressing, never a fact row. (external,'error') IS
+  -- present — this comment previously claimed it was absent, contradicting the CHECK;
+  -- corrected 2026-09-12. §4's precedence rule makes external_links membership
+  -- override kind, so an errored cross-sheet pull is external x error, and a
+  -- declared-external column must be able to hold measured literals, estimated
+  -- results and errors alike (the Stats/Taxes E-H case). The same list lives in
   -- loader21.LEGAL_ORIGIN_PRESENCE_PAIRS and is enforced at load time too, because
   -- origin's column-grain default lives on src_column while presence is row-grain —
   -- a cross-table rule SQL cannot see. P0 harness keeps the two lists equal.
@@ -585,9 +600,37 @@ CREATE TABLE decision_memo_ref (
 -- re-ingest supersedes its slice by construction (P03) — partial supersession can no
 -- longer publish a stale ordinal.
 -- Auditable: exposes source_id, batch_id, seq_in_date, ingested_at, value_text.
+-- SLICE B (blueprint v0.3 section 5): the trust labels are now part of the published
+-- surface, so filtering on them is the DEFAULT, not something a reader has to
+-- remember. Exposed per row: presence, origin, error_type.
+--   * presence/origin/error_type come straight from the row (row-grain, section 2).
+--   * derivation_kind is a COLUMN-grain fact living on src_column, so it is
+--     ATTRIBUTED to the row through the only linkage v0.2.5 stores:
+--     (source_id, account_id, metric_id). column_map_id names the src_column row the
+--     attribution came from; n_column_candidates says whether it was unique, and is
+--     stated as 0 when nothing matched — a missing attribution is a NUMBER here, never
+--     an absence a reader has to interpret. Zero candidates means the column was never
+--     curated, so derivation_kind NULL then means UNKNOWN, never "not derived": the two
+--     NULLs (curated-and-plain vs never-curated) stay distinguishable. Absence is never
+--     laundered into a value.
+--   * Both joins are LEFT joins against a GROUP BY-unique key and a PRIMARY KEY, so
+--     the row set is EXACTLY what it was: no row is added, duplicated or dropped.
+--   * `composition_class` + `is_additive` state the aggregation rule ONCE, here, so
+--     every consumer that sums this view uses the same definition instead of
+--     re-inventing the filter (and getting the NULL case wrong). Precedence matters:
+--     `copy` is a value of ORIGIN while the other classes label PRESENCE, and
+--     (copy, error) is a legal pair in v0.2.5 — a row whose origin is 'copy' is a copy
+--     whatever presence it inherited, because a copy inherits its source's presence.
+--     ADDITIVE (is_additive=1) = not a declared duplicate and not an error. Note
+--     origin is nullable on legacy rows, so the flag (or COALESCE(origin,'') <> 'copy')
+--     is the NULL-safe way to filter; a bare `origin <> 'copy'` silently drops them.
+-- A reader who wants only what the source actually measured filters
+-- presence = 'measured'; a reader who must not divide by fabricated rows filters
+-- presence <> 'zero_from_blank'.
 CREATE VIEW v_state_current AS
 WITH current_rows AS (
   SELECT f.state_id, f.account_id, f.metric_id, f.as_of, f.value_num, f.value_text,
+         f.presence, f.origin, f.error_type,
          f.period_grain, f.seq_in_date, f.source_id, f.batch_id, f.ingested_at,
          s.precedence, s.sheet_modified,
          ROW_NUMBER() OVER (
@@ -607,16 +650,42 @@ WITH current_rows AS (
                         AND f2.metric_id = f.metric_id
                         AND f2.as_of = f.as_of
                         AND f2.superseded_by_batch_id IS NULL)
+),
+column_derivation AS (
+  SELECT t.source_id, c.account_id, c.metric_id,
+         MIN(c.map_id) AS map_id, COUNT(*) AS n_candidates
+  FROM src_column c
+  JOIN src_tab t ON t.tab_id = c.tab_id
+  WHERE c.account_id IS NOT NULL AND c.metric_id IS NOT NULL
+    AND (c.role IS NULL OR c.role <> 'key')
+  GROUP BY t.source_id, c.account_id, c.metric_id
 )
-SELECT account_id, metric_id, as_of, value_num, value_text, period_grain,
-       seq_in_date, source_id, batch_id, ingested_at
-FROM current_rows WHERE rn = 1;
+SELECT cr.account_id, cr.metric_id, cr.as_of, cr.value_num, cr.value_text, cr.period_grain,
+       cr.seq_in_date, cr.source_id, cr.batch_id, cr.ingested_at,
+       cr.presence, cr.origin, cr.error_type,
+       CASE WHEN cr.origin = 'copy' THEN 'copy'
+            WHEN cr.presence = 'error' THEN 'error'
+            ELSE cr.presence END AS composition_class,
+       CASE WHEN cr.origin = 'copy' OR cr.presence = 'error' THEN 0 ELSE 1 END AS is_additive,
+       COALESCE(cd.n_candidates, 0) AS n_column_candidates,
+       cd.map_id       AS column_map_id,
+       c2.derivation_kind AS derivation_kind
+FROM current_rows cr
+LEFT JOIN column_derivation cd
+       ON cd.source_id = cr.source_id AND cd.account_id = cr.account_id
+      AND cd.metric_id = cr.metric_id
+LEFT JOIN src_column c2 ON c2.map_id = cd.map_id
+WHERE cr.rn = 1;
 
 -- Days where two or more sources disagree at equal declared authority — the COS
 -- curates these (P04/P14: no silent winner by insertion order).
+-- SLICE B: a disagreement between a copy and its source, or between a value and an
+-- errored cell, is not the same curation problem as two sources stating different
+-- measurements — so the labels have to be on this surface too.
 CREATE VIEW v_state_conflicts AS
 WITH ranked AS (
   SELECT f.account_id, f.metric_id, f.as_of, f.value_num, f.value_text,
+         f.presence, f.origin, f.error_type,
          f.source_id, f.batch_id, f.seq_in_date,
          s.precedence, s.sheet_modified,
          ROW_NUMBER() OVER (
@@ -638,7 +707,7 @@ WITH ranked AS (
                         AND f2.superseded_by_batch_id IS NULL)
 )
 SELECT account_id, metric_id, as_of, value_num, value_text, source_id, batch_id,
-       precedence, sheet_modified
+       precedence, sheet_modified, presence, origin, error_type
 FROM ranked r1
 WHERE rn > 1
   AND EXISTS (SELECT 1 FROM ranked r2
@@ -652,6 +721,12 @@ WHERE rn > 1
 -- Per-source latest batch for the (account, date) slice (P09/P10: re-ingest replaces
 -- the day's events by construction). UNMAPPED counts as cash — money is real, its type
 -- is unresolved; the bucket is always visible via txn_type + raw_label.
+-- SLICE B, FLAGGED NOT FAKED: there is NOTHING here to expose. fact_event carries no
+-- presence/origin — the ratified scope (blueprint v0.3 section 2) put presence on the
+-- four STATE families only, and the event family is not one of them. So the copy/error
+-- anti-double-count rule has no surface on this view, and cash flow is qualified by
+-- `quality` and `is_informational` instead. Giving fact_event the same labels is a
+-- schema change (CHECK + rebuild + version bump), not a view change: out of Slice B.
 CREATE VIEW v_cash_flow AS
 SELECT e.event_id, e.natural_key, e.account_id, e.event_date, e.seq_in_date,
        e.amount, e.quantity, e.price, e.fee, e.unit, e.quality, e.description,
@@ -672,16 +747,40 @@ WHERE e.superseded_by_batch_id IS NULL
 -- Household totals at month-end grain, aggregated across accounts, no magic metric name
 -- baked into the view itself (C2/U-3). Callers filter by metric; a missing metric is a
 -- visible empty set, not an impersonation of absence.
--- Only numeric components are summed; error/text components are counted in n_error so a
--- total can never look complete while a component is missing (P07 / leg C presence=error).
+-- SLICE B (blueprint v0.3 section 5): the total now declares what it rests on.
+--   * `total`, `min_component`, `max_component` are ADDITIVE totals: they cover only
+--     rows the read surface marks `is_additive = 1` — neither a declared duplicate nor
+--     an error. A copy is the same number stated twice (summing it with its source
+--     double-counts); an error row carries no value, so it must never be silently
+--     skipped as if it were a zero component. The rule is defined ONCE, on
+--     v_state_current, and consumed here.
+--   * `n_components` stays every current row in the group. The five n_* columns below
+--     are a PARTITION of it and always sum to it — that is the invariant the harness
+--     asserts — so a reader can see, without remembering a filter, whether a total
+--     rests on fabricated or duplicate rows.
+--   * `n_error` is FIXED: it counted `value_num IS NULL`, which is NOT presence='error'
+--     — an errored cell carries its token in value_text (so it was counted), while a
+--     non-error text component was counted as an error too. `n_additive_null_value`
+--     now carries the honest value-shape signal: additive rows with no numeric value
+--     contribute nothing to the total, so P07's promise — a total may never look
+--     complete while a component is missing — is enforced on the right signal.
+--   * `zero_from_blank` rows DO contribute (DM-2026-01: a blank inside a live row is a
+--     stated zero, and it is what reconciles the source's own total). They are counted
+--     separately so a reader who averages can divide by what the source observed.
 CREATE VIEW v_net_worth AS
 SELECT as_of, metric_id,
        CASE WHEN COUNT(DISTINCT period_grain) = 1 THEN MIN(period_grain) ELSE 'mixed' END AS period_grain,
-       SUM(value_num) AS total,
-       COUNT(*)       AS n_components,
-       SUM(CASE WHEN value_num IS NULL THEN 1 ELSE 0 END) AS n_error,
-       MIN(value_num) AS min_component,
-       MAX(value_num) AS max_component
+       SUM(CASE WHEN is_additive = 1 THEN value_num END) AS total,
+       COUNT(*) AS n_components,
+       SUM(CASE WHEN composition_class = 'measured' THEN 1 ELSE 0 END) AS n_measured,
+       SUM(CASE WHEN composition_class = 'estimated' THEN 1 ELSE 0 END) AS n_estimated,
+       SUM(CASE WHEN composition_class = 'copy' THEN 1 ELSE 0 END) AS n_copy,
+       SUM(CASE WHEN composition_class = 'zero_from_blank' THEN 1 ELSE 0 END) AS n_zero_from_blank,
+       SUM(CASE WHEN composition_class = 'error' THEN 1 ELSE 0 END) AS n_error,
+       SUM(is_additive) AS n_additive,
+       SUM(CASE WHEN is_additive = 1 AND value_num IS NULL THEN 1 ELSE 0 END) AS n_additive_null_value,
+       MIN(CASE WHEN is_additive = 1 THEN value_num END) AS min_component,
+       MAX(CASE WHEN is_additive = 1 THEN value_num END) AS max_component
 FROM v_state_current
 WHERE period_grain IN ('monthly','month-end')
 GROUP BY as_of, metric_id;
@@ -753,10 +852,16 @@ CREATE TABLE holding_state (
 );
 CREATE INDEX ix_holding_state ON holding_state (account_id, security_id, as_of);
 
+-- SLICE B: holding_state gained presence/origin/error_type in v0.2.5 but this view —
+-- the only read surface on it — did not carry them, so every aggregate over positions
+-- (including the allocation shares in finpage) silently summed copies and errored rows
+-- alongside measurements. Same rule as v_state_current: expose the labels so filtering
+-- is the default; which rows are returned is UNCHANGED.
 CREATE VIEW v_holding_current AS
 WITH cur AS (
   SELECT h.account_id, h.security_id, h.as_of, h.shares, h.cost_basis, h.market_value, h.price,
-         h.purchase_date, h.source_id, h.batch_id, h.ingested_at,
+         h.purchase_date, h.presence, h.origin, h.error_type,
+         h.source_id, h.batch_id, h.ingested_at,
          ROW_NUMBER() OVER (
            PARTITION BY h.account_id, h.security_id, h.as_of
            ORDER BY h.batch_id DESC, h.source_id DESC
@@ -769,5 +874,5 @@ WITH cur AS (
                         AND h2.superseded_by_batch_id IS NULL)
 )
 SELECT account_id, security_id, as_of, shares, cost_basis, market_value, price,
-       purchase_date, source_id, batch_id, ingested_at
+       purchase_date, presence, origin, error_type, source_id, batch_id, ingested_at
 FROM cur WHERE rn = 1;
